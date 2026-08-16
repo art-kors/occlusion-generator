@@ -8,7 +8,7 @@ from .config import SoilingConfig
 
 class SoilingModule(BaseOcclusionModule):
     def apply(self, image: torch.Tensor, depth: torch.Tensor, 
-              car_mask: torch.Tensor, cfg: SoilingConfig, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+              car_mask: torch.Tensor, cfg: SoilingConfig, dirt_buffer: list, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         
         if not cfg.enabled or cfg.intensity == 0.0:
             return image, torch.zeros_like(image[:, 0:1, :, :])
@@ -18,8 +18,6 @@ class SoilingModule(BaseOcclusionModule):
         soil_mask = torch.zeros(b, 1, h, w, device=device)
         soil_texture = image.clone() 
         num_defects = max(1, int(cfg.intensity * 8))
-        
-        dirt_buffer = kwargs.get("dirt_textures")
 
         for i in range(num_defects):
             min_size = int(min(h, w) * 0.05)
