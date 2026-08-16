@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "occlusion_generator"
+version = "0.1.0"
+description = "Modular pipeline for generating multi-occlusion datasets."
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "kornia>=0.7.0",
+    "pydantic>=2.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["occlusion_generator*"]
