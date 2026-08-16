@@ -3,8 +3,8 @@ import torch.nn.functional as F
 import kornia
 from PIL import Image
 import numpy as np
-from ..interfaces import BaseOcclusionModule
-from ..config import SoilingConfig
+from .interfaces import BaseOcclusionModule
+from .config import SoilingConfig
 
 class SoilingModule(BaseOcclusionModule):
     def apply(self, image: torch.Tensor, depth: torch.Tensor, 
@@ -19,7 +19,6 @@ class SoilingModule(BaseOcclusionModule):
         soil_texture = image.clone() 
         num_defects = max(1, int(cfg.intensity * 8))
         
-        # ВАЖНО: Забираем буфер из kwargs
         dirt_buffer = kwargs.get("dirt_textures")
 
         for i in range(num_defects):
@@ -30,12 +29,10 @@ class SoilingModule(BaseOcclusionModule):
             cx = torch.randint(0, w, (1,)).item()
             cy = torch.randint(0, h, (1,)).item()
 
-            # ПРОВЕРЯЕМ: ПРИШЛИ ЛИ НАМ ТЕКСТУРЫ?
             if dirt_buffer is not None and len(dirt_buffer) > 0:
                 idx = torch.randint(0, len(dirt_buffer), (1,)).item()
                 item = dirt_buffer[idx]
                 
-                # Конвертим PIL в тензор
                 if isinstance(item, Image.Image):
                     tex = torch.from_numpy(np.array(item)).permute(2, 0, 1).float() / 255.0
                 else:
@@ -47,11 +44,9 @@ class SoilingModule(BaseOcclusionModule):
                 patch_rgb = tex_resized[:, :3, :, :]
                 patch_alpha = tex_resized[:, 3:4, :, :]
                 
-                # Накладываем альфой
                 soil_texture = soil_texture * (1 - patch_alpha) + patch_rgb * patch_alpha
                 soil_mask = torch.clamp(soil_mask + patch_alpha, 0, 1)
             else:
-                # ЭТОТ БЛОК НЕ ДОЛЖЕН ВЫПОЛНЯТЬСЯ, НО ЕСЛИ ВЫПОЛНЯЕТСЯ - ЭТО КРУГИ
                 print("⚠️ ВНИМАНИЕ: Я РИСУЮ КРУГИ, ПОТОМУ ЧТО dirt_buffer ПУСТОЙ!")
                 y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
                 dist_sq = (x - cx)**2 + (y - cy)**2
