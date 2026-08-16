@@ -3,8 +3,8 @@ import torch.nn.functional as F
 import kornia
 from PIL import Image
 import numpy as np
-from .interfaces import BaseOcclusionModule
-from .config import SoilingConfig
+from ..interfaces import BaseOcclusionModule
+from ..config import SoilingConfig
 
 class SoilingModule(BaseOcclusionModule):
     def apply(self, image: torch.Tensor, depth: torch.Tensor, 
