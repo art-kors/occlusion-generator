@@ -17,68 +17,51 @@ class SoilingModule(BaseOcclusionModule):
         soil_texture = image.clone() 
         
         num_defects = max(1, int(cfg.intensity * 8))
-        
-        # Получаем батч с реальными текстурами (B_s, 4, H_s, W_s) - 4 канала это RGBA
         dirt_buffer = kwargs.get("dirt_textures")
 
         for i in range(num_defects):
-            # 1. Случайный размер и позиция
             min_size = int(min(h, w) * 0.05)
             max_size = int(min(h, w) * 0.4)
             rand_h = torch.randint(min_size, max_size, (1,)).item()
             rand_w = torch.randint(min_size, max_size, (1,)).item()
-            
             cx = torch.randint(0, w, (1,)).item()
             cy = torch.randint(0, h, (1,)).item()
 
             if dirt_buffer is not None and len(dirt_buffer) > 0:
-                # --- ИСПОЛЬЗУЕМ РЕАЛЬНЫЕ ТЕКСТУРЫ ---
                 idx = torch.randint(0, len(dirt_buffer), (1,)).item()
-                tex = dirt_buffer[idx].unsqueeze(0).to(device) # (1, 4, H_s, W_s)
+                item = dirt_buffer[idx]
                 
-                # Ресайзим до случайного размера!
+                # ФИКС ДЛЯ COLAB: Конвертим PIL в тензор ТОЛЬКО когда-needed, чтобы не жрать RAM
+                if isinstance(item, Image.Image):
+                    tex = torch.from_numpy(np.array(item)).permute(2, 0, 1).float() / 255.0
+                else:
+                    tex = item
+                    
+                tex = tex.unsqueeze(0).to(device) # (1, 4, H, W)
                 tex_resized = kornia.geometry.transform.resize(tex, (rand_h, rand_w), antialias=True)
                 
                 patch_rgb = tex_resized[:, :3, :, :]
                 patch_alpha = tex_resized[:, 3:4, :, :]
                 
-                # Определяем, капля это (квадратная форма) или грязь (вытянутая)
                 is_drop = 0.7 < (rand_h / rand_w) < 1.3
                 
                 if is_drop and cfg.apply_distortion:
-                    # --- ЛОГИКА ПРЕЛОМЛЕНИЯ КАПЛИ ---
-                    grid_y, grid_x = torch.meshgrid(
-                        torch.linspace(-1, 1, rand_h, device=device),
-                        torch.linspace(-1, 1, rand_w, device=device), indexing='ij')
-                    
-                    # Центр капли
-                    cy_n, cx_n = 0.0, 0.0
-                    dist_sq = (grid_x - cx_n)**2 + (grid_y - cy_n)**2
-                    r = 1.0
-                    normalized_dist = torch.sqrt(dist_sq) / r
-                    normalized_dist = torch.clamp(normalized_dist, 0, 1)
-                    
-                    # Вектор искажения (линза)
-                    dx = (grid_x - cx_n) * normalized_dist * 0.05
-                    dy = (grid_y - cy_n) * normalized_dist * 0.05
-                    dx_norm = dx / (rand_w / 2)
-                    dy_norm = dy / (rand_h / 2)
-                    
-                    grid = torch.stack([grid_x + dx_norm, grid_y + dy_norm], dim=-1)
-                    grid = grid.unsqueeze(0).expand(b, -1, -1, -1)
-                    
-                    # Искажаем фон под каплей
+                    # Преломление капли
+                    grid_y, grid_x = torch.meshgrid(torch.linspace(-1, 1, rand_h, device=device), torch.linspace(-1, 1, rand_w, device=device), indexing='ij')
+                    dist_sq = grid_x**2 + grid_y**2
+                    normalized_dist = torch.clamp(torch.sqrt(dist_sq), 0, 1)
+                    dx = grid_x * normalized_dist * 0.05 / (rand_w / 2)
+                    dy = grid_y * normalized_dist * 0.05 / (rand_h / 2)
+                    grid = torch.stack([grid_x + dx, grid_y + dy], dim=-1).unsqueeze(0).expand(b, -1, -1, -1)
                     warped_patch = F.grid_sample(image, grid, align_corners=True, mode='bilinear', padding_mode='border')
-                    
-                    # Накладываем искаженный фон туда, где альфа-канал капли > 0.5
                     soil_texture = torch.where(patch_alpha > 0.5, warped_patch, soil_texture)
                 else:
-                    # --- ЛОГИКА ГРЯЗИ (Простое наложение) ---
+                    # Наложение грязи
                     soil_texture = soil_texture * (1 - patch_alpha) + patch_rgb * patch_alpha
                     
                 soil_mask = torch.clamp(soil_mask + patch_alpha, 0, 1)
             else:
-                # --- ФОЛЛБЭК (Процедурная генерация) ---
+                # Фоллбэк
                 y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
                 dist_sq = (x - cx)**2 + (y - cy)**2
                 r = rand_h / 2
