@@ -35,7 +35,6 @@ class SoilingModule(BaseOcclusionModule):
             [B, 1, H, W] float tensor in [0, 1].
     """
 
-    class SoilingModule(BaseOcclusionModule):
     @staticmethod
     def _texture_to_alpha(
         texture: Any,
