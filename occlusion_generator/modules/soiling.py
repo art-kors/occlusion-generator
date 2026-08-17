@@ -97,145 +97,111 @@ class SoilingModule(BaseOcclusionModule):
         return alpha.clamp(0.0, 1.0)
 
     def apply(
-        self,
-        image: torch.Tensor,
-        depth: torch.Tensor,
-        car_mask: torch.Tensor | None,
-        cfg: SoilingConfig,
-        dirt_buffer=None,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if image.ndim != 4:
-            raise ValueError(
-                f"`image` must have shape [B,C,H,W], got {tuple(image.shape)}"
+    self,
+    image: torch.Tensor,
+    depth: torch.Tensor,
+    car_mask: torch.Tensor | None,
+    cfg: SoilingConfig,
+    dirt_buffer=None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    batch_size, _, height, width = image.shape
+    device = image.device
+    dtype = image.dtype
+
+    soil_mask = torch.zeros(
+        (batch_size, 1, height, width),
+        device=device,
+        dtype=dtype,
+    )
+
+    if dirt_buffer is None or len(dirt_buffer) == 0:
+        return image, soil_mask
+
+    intensity = float(cfg.intensity)
+
+    if intensity <= 0:
+        return image, soil_mask
+
+    num_patches = max(
+        1,
+        int(round(cfg.max_patches * intensity)),
+    )
+
+    for batch_idx in range(batch_size):
+        for _ in range(num_patches):
+            texture_idx = torch.randint(
+                0,
+                len(dirt_buffer),
+                (1,),
+                device=device,
+            ).item()
+
+            alpha = self._texture_to_alpha(
+                dirt_buffer[texture_idx],
+                device,
             )
 
-        batch_size, _, height, width = image.shape
-        device = image.device
-        dtype = image.dtype
+            if alpha.numel() == 0:
+                continue
 
-        soil_mask = torch.zeros(
-            (batch_size, 1, height, width),
-            device=device,
-            dtype=dtype,
-        )
+            tex_height, tex_width = alpha.shape
 
-        if not dirt_buffer:
-            return image, soil_mask
+            patch_width = min(
+                width,
+                max(1, int(width * 0.2)),
+            )
 
-        intensity = float(cfg.intensity)
-        intensity = max(0.0, min(1.0, intensity))
-
-        if intensity <= 0.0:
-            return image, soil_mask
-
-        max_patches = int(getattr(cfg, "max_patches", 32))
-        num_patches = int(round(intensity * max_patches))
-
-        if num_patches <= 0:
-            return image, soil_mask
-
-        min_scale = float(getattr(cfg, "min_scale", 0.05))
-        max_scale = float(getattr(cfg, "max_scale", 0.25))
-
-        generator = kwargs.get("generator")
-
-        if car_mask is not None:
-            if car_mask.ndim == 3:
-                car_mask = car_mask.unsqueeze(1)
-
-            if car_mask.shape[-2:] != (height, width):
-                car_mask = F.interpolate(
-                    car_mask.float(),
-                    size=(height, width),
-                    mode="nearest",
-                )
-
-            car_mask = car_mask.to(
-                device=device,
-                dtype=torch.float32,
-            ).clamp(0.0, 1.0)
-
-        for batch_idx in range(batch_size):
-            for _ in range(num_patches):
-                texture_idx = torch.randint(
-                    len(dirt_buffer),
-                    (1,),
-                    device=device,
-                    generator=generator,
-                ).item()
-
-                alpha = self._texture_to_alpha(
-                    dirt_buffer[texture_idx],
-                    device,
-                )
-
-                tex_height, tex_width = alpha.shape
-
-                scale = torch.empty(
-                    1,
-                    device=device,
-                ).uniform_(
-                    min_scale,
-                    max_scale,
-                    generator=generator,
-                ).item()
-
-                patch_width = max(1, int(width * scale))
-                patch_height = max(
+            patch_height = min(
+                height,
+                max(
                     1,
                     int(patch_width * tex_height / tex_width),
-                )
+                ),
+            )
 
-                patch_width = min(patch_width, width)
-                patch_height = min(patch_height, height)
+            alpha = F.interpolate(
+                alpha[None, None],
+                size=(patch_height, patch_width),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
 
-                alpha = F.interpolate(
-                    alpha[None, None],
-                    size=(patch_height, patch_width),
-                    mode="bilinear",
-                    align_corners=False,
-                )[0, 0]
+            x = torch.randint(
+                0,
+                max(1, width - patch_width + 1),
+                (1,),
+                device=device,
+            ).item()
 
-                max_x = width - patch_width
-                max_y = height - patch_height
+            y = torch.randint(
+                0,
+                max(1, height - patch_height + 1),
+                (1,),
+                device=device,
+            ).item()
 
-                x = torch.randint(
-                    max_x + 1,
-                    (1,),
-                    device=device,
-                    generator=generator,
-                ).item()
-
-                y = torch.randint(
-                    max_y + 1,
-                    (1,),
-                    device=device,
-                    generator=generator,
-                ).item()
-
-                patch = alpha
-
-                if car_mask is not None:
-                    patch = patch * car_mask[
-                        batch_idx,
-                        0,
-                        y : y + patch_height,
-                        x : x + patch_width,
-                    ]
-
-                current = soil_mask[
-                    batch_idx,
-                    0,
-                    y : y + patch_height,
-                    x : x + patch_width,
-                ]
-
+            soil_mask[
+                batch_idx,
+                0,
+                y : y + patch_height,
+                x : x + patch_width,
+            ] = torch.maximum(
                 soil_mask[
                     batch_idx,
                     0,
                     y : y + patch_height,
                     x : x + patch_width,
-                ] = 1.0 - (1.0 - current) * (1.0 - patch)
-
-        return image, soil_mask.clamp(0.0, 1.0)
+                ],
+                alpha.to(dtype),
+            )
+    print(
+    "soil_mask:",
+    soil_mask.min().item(),
+    soil_mask.max().item(),
+    soil_mask.mean().item(),
+    "nonzero:",
+    (soil_mask > 0).sum().item(),
+)
+    return image, soil_mask
