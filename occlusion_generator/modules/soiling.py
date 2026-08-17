@@ -259,7 +259,12 @@ class SoilingModule(BaseOcclusionModule):
         alpha = texture[:, 3:4]
 
         alpha = self._soften_alpha(alpha=alpha, device=device, severity=severity)
-        alpha, strength = self._apply_random_opacity(alpha=alpha, intensity=intensity, severity=severity, device=device)
+        alpha, strength = self._apply_severity_opacity(
+            alpha=alpha,
+            intensity=intensity,
+            severity=severity,
+            device=device,
+        )
 
         center = self._sample_patch_center(width=image_width, height=image_height, device=device)
 
@@ -342,24 +347,18 @@ class SoilingModule(BaseOcclusionModule):
         return (alpha / (alpha_max + 1e-6)).clamp(0.0, 1.0)
 
     @staticmethod
-    def _apply_random_opacity(
-        alpha: torch.Tensor, intensity: float, severity: float, device: torch.device
+    def _apply_severity_opacity(
+        alpha: torch.Tensor,
+        intensity: float,
+        severity: float,
+        device: torch.device,
     ) -> tuple[torch.Tensor, float]:
-        min_opacity = min(1.0, 0.04 + 0.16 * severity + 0.05 * intensity)
-        max_opacity = min(1.0, 0.25 + 0.75 * severity)
+        opacity = 0.03 + 0.97 * (severity ** 1.35)
+        opacity = min(1.0, max(0.0, opacity))
 
-        random_value = torch.rand(1, device=device).item()
-        exponent = max(0.35, 1.8 - 1.45 * severity)
-        random_value = random_value ** exponent
+        alpha = (alpha * opacity).clamp(0.0, 1.0)
 
-        opacity = min_opacity + (max_opacity - min_opacity) * random_value
-
-        # High severity creates genuinely opaque chunks
-        opaque_probability = max(0.0, severity - 0.72) * 0.65
-        if severity > 0.72 and torch.rand(1, device=device).item() < opaque_probability:
-            opacity = torch.empty(1, device=device).uniform_(0.85, 1.0).item()
-
-        return (alpha * opacity).clamp(0.0, 1.0), float(opacity)
+        return alpha, float(opacity)
 
     # ------------------------------------------------------------------
     # Dirty appearance (NEW LOGIC)
