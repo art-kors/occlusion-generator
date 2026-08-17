@@ -15,18 +15,10 @@ class SoilingModule(BaseOcclusionModule):
     """
     Generates a dirt mask without modifying the input image.
 
-    The module intentionally performs no texture processing:
-        - no resize
-        - no rotation
-        - no blur
-        - no color processing
-        - no opacity modification
-        - no severity
-        - no additional randomness inside the texture
+    `intensity` controls only the number of dirt patches (degree of contamination from 0 to 1).
 
-    `intensity` controls only the number of dirt patches.
-
-    Texture alpha is used directly as the dirt mask.
+    patch textures are sampled from a provided buffer of dirt textures. 
+    The textures can be provided as PIL images or torch tensors.
 
     Expected texture:
         RGB/RGBA PIL Image
@@ -43,6 +35,68 @@ class SoilingModule(BaseOcclusionModule):
             [B, 1, H, W] float tensor in [0, 1].
     """
 
+    class SoilingModule(BaseOcclusionModule):
+    @staticmethod
+    def _texture_to_alpha(
+        texture: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(texture, Image.Image):
+            image = texture.convert("RGBA")
+            array = np.asarray(image)
+
+            tensor = (
+                torch.from_numpy(array)
+                .permute(2, 0, 1)
+                .contiguous()
+                .to(device=device, dtype=torch.float32)
+                / 255.0
+            )
+
+        elif isinstance(texture, torch.Tensor):
+            tensor = texture.to(device=device, dtype=torch.float32)
+
+            if tensor.ndim == 4:
+                if tensor.shape[0] == 0:
+                    raise ValueError("Empty texture tensor")
+                tensor = tensor[0]
+
+            if tensor.ndim != 3:
+                raise ValueError(
+                    "Texture tensor must have shape [C,H,W] "
+                    f"or [B,C,H,W], got {tuple(tensor.shape)}"
+                )
+
+            if tensor.numel() > 0 and tensor.max() > 1.0:
+                tensor = tensor / 255.0
+
+            tensor = tensor.clamp(0.0, 1.0)
+
+        else:
+            raise TypeError(
+                "Dirt texture must be a PIL Image or torch.Tensor, "
+                f"got {type(texture)!r}"
+            )
+
+        channels = tensor.shape[0]
+
+        if channels == 1:
+            alpha = tensor[0]
+        elif channels == 3:
+            alpha = torch.ones(
+                tensor.shape[-2:],
+                device=device,
+                dtype=torch.float32,
+            )
+        elif channels == 4:
+            alpha = tensor[3]
+        else:
+            raise ValueError(
+                f"Texture must have 1, 3 or 4 channels, got {channels}"
+            )
+
+        return alpha.clamp(0.0, 1.0)
+
     def apply(
         self,
         image: torch.Tensor,
@@ -52,242 +106,137 @@ class SoilingModule(BaseOcclusionModule):
         dirt_buffer=None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        if image.ndim != 4 or image.shape[1] < 3:
+        if image.ndim != 4:
             raise ValueError(
-                "SoilingModule expects image with shape [B, C, H, W], "
-                f"got {tuple(image.shape)}"
+                f"`image` must have shape [B,C,H,W], got {tuple(image.shape)}"
             )
 
-        if not cfg.enabled or float(cfg.intensity) <= 0.0:
-            return image, torch.zeros_like(image[:, :1])
-
-        if dirt_buffer is None:
-            dirt_buffer = kwargs.get("dirt_textures")
-
-        if not dirt_buffer:
-            raise RuntimeError(
-                "SoilingModule requires a non-empty dirt_buffer."
-            )
-
-        batch_size, _, image_height, image_width = image.shape
+        batch_size, _, height, width = image.shape
         device = image.device
         dtype = image.dtype
 
-        intensity = max(
-            0.0,
-            min(1.0, float(cfg.intensity)),
-        )
-
-        # Number of independently placed dirt textures.
-        num_patches = max(
-            1,
-            round(1 + 9 * intensity),
-        )
-
         soil_mask = torch.zeros(
-            batch_size,
-            1,
-            image_height,
-            image_width,
+            (batch_size, 1, height, width),
             device=device,
             dtype=dtype,
         )
 
-        for _ in range(num_patches):
+        if not dirt_buffer:
+            return image, soil_mask
 
-            # ----------------------------------------------------------
-            # Sample texture
-            # ----------------------------------------------------------
+        intensity = float(cfg.intensity)
+        intensity = max(0.0, min(1.0, intensity))
 
-            texture = dirt_buffer[
-                torch.randint(
-                    len(dirt_buffer),
-                    (),
-                    device=device,
-                ).item()
-            ]
+        if intensity <= 0.0:
+            return image, soil_mask
 
-            if isinstance(texture, Image.Image):
+        max_patches = int(getattr(cfg, "max_patches", 32))
+        num_patches = int(round(intensity * max_patches))
 
-                texture = np.asarray(
-                    texture.convert("RGBA")
-                )
+        if num_patches <= 0:
+            return image, soil_mask
 
-                texture = (
-                    torch.from_numpy(texture)
-                    .permute(2, 0, 1)
-                    .float()
-                    / 255.0
-                )
+        min_scale = float(getattr(cfg, "min_scale", 0.05))
+        max_scale = float(getattr(cfg, "max_scale", 0.25))
 
-            elif torch.is_tensor(texture):
-
-                if texture.ndim == 4:
-                    texture = texture[0]
-
-                if texture.ndim != 3:
-                    raise ValueError(
-                        "Dirt texture must have shape [C,H,W] "
-                        "or [B,C,H,W], "
-                        f"got {tuple(texture.shape)}"
-                    )
-
-                texture = texture.float()
-
-                if texture.max() > 1.0:
-                    texture = texture / 255.0
-
-            else:
-                raise TypeError(
-                    "Unsupported dirt texture type: "
-                    f"{type(texture)}"
-                )
-
-            texture = texture.to(
-                device=device,
-                dtype=dtype,
-            ).clamp(0.0, 1.0)
-
-            if texture.shape[0] == 3:
-
-                alpha = torch.ones(
-                    1,
-                    texture.shape[1],
-                    texture.shape[2],
-                    device=device,
-                    dtype=dtype,
-                )
-
-                texture = torch.cat(
-                    [texture, alpha],
-                    dim=0,
-                )
-
-            elif texture.shape[0] != 4:
-
-                raise ValueError(
-                    "Dirt texture must contain 3 or 4 channels, "
-                    f"got {texture.shape[0]}"
-                )
-
-            # ----------------------------------------------------------
-            # Take alpha exactly as supplied by the texture.
-            # ----------------------------------------------------------
-
-            patch = texture[3:4]
-
-            patch_height, patch_width = patch.shape[-2:]
-
-            # Ignore textures that cannot fit at all.
-            if (
-                patch_height > image_height
-                or patch_width > image_width
-            ):
-                patch = F.interpolate(
-                    patch.unsqueeze(0),
-                    size=(
-                        min(patch_height, image_height),
-                        min(patch_width, image_width),
-                    ),
-                    mode="nearest",
-                )[0]
-
-                patch_height, patch_width = patch.shape[-2:]
-
-            # ----------------------------------------------------------
-            # Random placement.
-            # ----------------------------------------------------------
-
-            max_x = image_width - patch_width
-            max_y = image_height - patch_height
-
-            x = (
-                torch.randint(
-                    max_x + 1,
-                    (),
-                    device=device,
-                ).item()
-                if max_x > 0
-                else 0
-            )
-
-            y = (
-                torch.randint(
-                    max_y + 1,
-                    (),
-                    device=device,
-                ).item()
-                if max_y > 0
-                else 0
-            )
-
-            # ----------------------------------------------------------
-            # Composite dirt masks.
-            #
-            # Overlapping dirt accumulates:
-            #
-            #   A + B * (1 - A)
-            #
-            # so several overlapping patches can reach opacity 1.
-            # ----------------------------------------------------------
-
-            existing = soil_mask[
-                :,
-                :,
-                y:y + patch_height,
-                x:x + patch_width,
-            ]
-
-            combined = (
-                existing
-                + patch.unsqueeze(0)
-                * (1.0 - existing)
-            )
-
-            soil_mask[
-                :,
-                :,
-                y:y + patch_height,
-                x:x + patch_width,
-            ] = combined.clamp(0.0, 1.0)
-
-        # --------------------------------------------------------------
-        # Restrict dirt to the valid car region.
-        # --------------------------------------------------------------
+        generator = kwargs.get("generator")
 
         if car_mask is not None:
-
             if car_mask.ndim == 3:
                 car_mask = car_mask.unsqueeze(1)
 
-            if car_mask.ndim != 4:
-                raise ValueError(
-                    "car_mask must have shape [B,H,W] or [B,1,H,W], "
-                    f"got {tuple(car_mask.shape)}"
-                )
-
-            car_mask = car_mask[:, :1]
-
-            if car_mask.shape[-2:] != (
-                image_height,
-                image_width,
-            ):
+            if car_mask.shape[-2:] != (height, width):
                 car_mask = F.interpolate(
                     car_mask.float(),
-                    size=(
-                        image_height,
-                        image_width,
-                    ),
+                    size=(height, width),
                     mode="nearest",
                 )
 
             car_mask = car_mask.to(
                 device=device,
-                dtype=dtype,
+                dtype=torch.float32,
             ).clamp(0.0, 1.0)
 
-            soil_mask *= car_mask
+        for batch_idx in range(batch_size):
+            for _ in range(num_patches):
+                texture_idx = torch.randint(
+                    len(dirt_buffer),
+                    (1,),
+                    device=device,
+                    generator=generator,
+                ).item()
 
-        # The module is a pure mask generator.
-        return image, soil_mask
+                alpha = self._texture_to_alpha(
+                    dirt_buffer[texture_idx],
+                    device,
+                )
+
+                tex_height, tex_width = alpha.shape
+
+                scale = torch.empty(
+                    1,
+                    device=device,
+                ).uniform_(
+                    min_scale,
+                    max_scale,
+                    generator=generator,
+                ).item()
+
+                patch_width = max(1, int(width * scale))
+                patch_height = max(
+                    1,
+                    int(patch_width * tex_height / tex_width),
+                )
+
+                patch_width = min(patch_width, width)
+                patch_height = min(patch_height, height)
+
+                alpha = F.interpolate(
+                    alpha[None, None],
+                    size=(patch_height, patch_width),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
+
+                max_x = width - patch_width
+                max_y = height - patch_height
+
+                x = torch.randint(
+                    max_x + 1,
+                    (1,),
+                    device=device,
+                    generator=generator,
+                ).item()
+
+                y = torch.randint(
+                    max_y + 1,
+                    (1,),
+                    device=device,
+                    generator=generator,
+                ).item()
+
+                patch = alpha
+
+                if car_mask is not None:
+                    patch = patch * car_mask[
+                        batch_idx,
+                        0,
+                        y : y + patch_height,
+                        x : x + patch_width,
+                    ]
+
+                current = soil_mask[
+                    batch_idx,
+                    0,
+                    y : y + patch_height,
+                    x : x + patch_width,
+                ]
+
+                soil_mask[
+                    batch_idx,
+                    0,
+                    y : y + patch_height,
+                    x : x + patch_width,
+                ] = 1.0 - (1.0 - current) * (1.0 - patch)
+
+        return image, soil_mask.clamp(0.0, 1.0)
