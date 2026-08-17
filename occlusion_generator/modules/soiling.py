@@ -8,6 +8,20 @@ from ..config import SoilingConfig
 
 
 class SoilingModule(BaseOcclusionModule):
+    """
+    Applies dirt/soiling textures to an image.
+
+    Input:
+        image:    [B, 3, H, W], expected in [0, 1]
+        car_mask: [B, 1, H, W] or [B, H, W], expected in [0, 1]
+
+    dirt_buffer:
+        List of PIL RGB/RGBA images or torch tensors.
+
+    Output:
+        soil_texture: [B, 3, H, W]
+        soil_mask:    [B, 1, H, W]
+    """
 
     def apply(
         self,
@@ -19,56 +33,71 @@ class SoilingModule(BaseOcclusionModule):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
+        # =========================================================
+        # Disabled
+        # =========================================================
+
         if not cfg.enabled or cfg.intensity <= 0.0:
             return (
                 image,
                 torch.zeros_like(image[:, 0:1, :, :]),
             )
 
+        # =========================================================
+        # Validate image
+        # =========================================================
+
         if image.ndim != 4:
             raise ValueError(
-                f"Expected image [B,C,H,W], got {tuple(image.shape)}"
+                f"SoilingModule expects image [B,C,H,W], "
+                f"got {tuple(image.shape)}"
             )
 
         b, c, h, w = image.shape
 
         if c < 3:
             raise ValueError(
-                f"Expected at least 3 channels, got {c}"
+                f"SoilingModule expects at least 3 channels, "
+                f"got {c}"
             )
 
         device = image.device
         dtype = image.dtype
 
-        # ---------------------------------------------------------
+        # =========================================================
         # Get dirt buffer
-        # ---------------------------------------------------------
+        # =========================================================
 
         if dirt_buffer is None:
             dirt_buffer = kwargs.get("dirt_textures")
 
         if dirt_buffer is None or len(dirt_buffer) == 0:
             raise RuntimeError(
-                "SoilingModule: dirt_buffer is empty."
+                "SoilingModule: dirt_buffer is empty. "
+                "Pass dirt_buffer=... or dirt_textures=..."
             )
 
-        # ---------------------------------------------------------
+        # =========================================================
         # Prepare image
-        # ---------------------------------------------------------
+        # =========================================================
 
         soil_texture = image[:, :3].clone()
 
-        # Important:
-        # Keep image in valid range.
+        # Make sure blending operates in [0, 1].
         soil_texture = soil_texture.clamp(0.0, 1.0)
 
-        # ---------------------------------------------------------
+        # =========================================================
         # Prepare car mask
-        # ---------------------------------------------------------
+        # =========================================================
 
         if car_mask is None:
 
-            car_mask = torch.ones(
+            print(
+                "[Soiling] WARNING: car_mask is None. "
+                "Using full-frame mask for debugging."
+            )
+
+            effective_car_mask = torch.ones(
                 b,
                 1,
                 h,
@@ -81,6 +110,18 @@ class SoilingModule(BaseOcclusionModule):
 
             if car_mask.ndim == 3:
                 car_mask = car_mask.unsqueeze(1)
+
+            if car_mask.ndim != 4:
+                raise ValueError(
+                    f"car_mask must be [B,1,H,W] or [B,H,W], "
+                    f"got {tuple(car_mask.shape)}"
+                )
+
+            if car_mask.shape[0] != b:
+                raise ValueError(
+                    f"car_mask batch={car_mask.shape[0]} "
+                    f"does not match image batch={b}"
+                )
 
             if car_mask.shape[-2:] != (h, w):
 
@@ -100,35 +141,72 @@ class SoilingModule(BaseOcclusionModule):
 
             car_mask = car_mask.clamp(0.0, 1.0)
 
-        # ---------------------------------------------------------
-        # DEBUG
-        # ---------------------------------------------------------
+            mask_min = car_mask.min().item()
+            mask_max = car_mask.max().item()
 
-        print(
-            "[Soiling]"
-            f" image={tuple(image.shape)}"
-            f" image_range=({soil_texture.min().item():.3f},"
-            f"{soil_texture.max().item():.3f})"
-            f" car_mask_range=({car_mask.min().item():.3f},"
-            f"{car_mask.max().item():.3f})"
-            f" textures={len(dirt_buffer)}"
-        )
+            print(
+                f"[Soiling] car_mask_range="
+                f"({mask_min:.3f}, {mask_max:.3f})"
+            )
 
-        # ---------------------------------------------------------
+            # -----------------------------------------------------
+            # TEMPORARY DEBUG FALLBACK
+            #
+            # Your current pipeline produces:
+            #
+            # car_mask_range=(0.000, 0.000)
+            #
+            # That completely removes every dirt patch.
+            #
+            # For now, use full-frame mask so we can verify
+            # that the actual texture compositing works.
+            # -----------------------------------------------------
+
+            if mask_max <= 0.0:
+
+                print(
+                    "[Soiling] WARNING: car_mask is completely empty. "
+                    "Ignoring car_mask temporarily."
+                )
+
+                effective_car_mask = torch.ones_like(
+                    car_mask
+                )
+
+            else:
+
+                effective_car_mask = car_mask
+
+        # =========================================================
         # Intensity
-        # ---------------------------------------------------------
+        # =========================================================
 
         intensity = float(cfg.intensity)
-        intensity = max(0.0, min(1.0, intensity))
 
+        intensity = max(
+            0.0,
+            min(1.0, intensity),
+        )
+
+        # 1.0 -> 8 patches
         num_defects = max(
             1,
             int(round(intensity * 8)),
         )
 
-        # ---------------------------------------------------------
-        # Output mask
-        # ---------------------------------------------------------
+        print(
+            f"[Soiling] image={tuple(image.shape)} "
+            f"image_range=("
+            f"{soil_texture.min().item():.3f},"
+            f"{soil_texture.max().item():.3f}) "
+            f"textures={len(dirt_buffer)} "
+            f"intensity={intensity:.3f} "
+            f"defects={num_defects}"
+        )
+
+        # =========================================================
+        # Soil mask
+        # =========================================================
 
         soil_mask = torch.zeros(
             b,
@@ -139,11 +217,15 @@ class SoilingModule(BaseOcclusionModule):
             dtype=dtype,
         )
 
-        # ---------------------------------------------------------
+        # =========================================================
         # Generate patches
-        # ---------------------------------------------------------
+        # =========================================================
 
         for defect_idx in range(num_defects):
+
+            # -----------------------------------------------------
+            # Random patch size
+            # -----------------------------------------------------
 
             min_size = max(
                 2,
@@ -169,6 +251,10 @@ class SoilingModule(BaseOcclusionModule):
                 device=device,
             ).item()
 
+            # -----------------------------------------------------
+            # Random center
+            # -----------------------------------------------------
+
             cx = torch.randint(
                 0,
                 w,
@@ -184,24 +270,30 @@ class SoilingModule(BaseOcclusionModule):
             ).item()
 
             # -----------------------------------------------------
-            # Select texture
+            # Select random texture
             # -----------------------------------------------------
 
-            idx = torch.randint(
+            texture_idx = torch.randint(
                 0,
                 len(dirt_buffer),
                 (1,),
                 device=device,
             ).item()
 
+            item = dirt_buffer[texture_idx]
+
+            # -----------------------------------------------------
+            # Convert texture
+            # -----------------------------------------------------
+
             tex = self._texture_to_tensor(
-                dirt_buffer[idx],
+                item=item,
                 device=device,
                 dtype=dtype,
             )
 
             # -----------------------------------------------------
-            # Resize
+            # Resize texture
             # -----------------------------------------------------
 
             tex = F.interpolate(
@@ -211,11 +303,11 @@ class SoilingModule(BaseOcclusionModule):
                 align_corners=False,
             )
 
-            patch_rgb = tex[:, :3]
-            patch_alpha = tex[:, 3:4]
+            patch_rgb = tex[:, :3, :, :]
+            patch_alpha = tex[:, 3:4, :, :]
 
             # -----------------------------------------------------
-            # Alpha
+            # Apply intensity to alpha
             # -----------------------------------------------------
 
             patch_alpha = (
@@ -223,7 +315,7 @@ class SoilingModule(BaseOcclusionModule):
             ).clamp(0.0, 1.0)
 
             # -----------------------------------------------------
-            # Coordinates
+            # Calculate position
             # -----------------------------------------------------
 
             x1 = cx - rand_w // 2
@@ -232,11 +324,13 @@ class SoilingModule(BaseOcclusionModule):
             x2 = x1 + rand_w
             y2 = y1 + rand_h
 
+            # Destination coordinates in image
             dst_x1 = max(0, x1)
             dst_y1 = max(0, y1)
             dst_x2 = min(w, x2)
             dst_y2 = min(h, y2)
 
+            # Source coordinates in texture
             src_x1 = max(0, -x1)
             src_y1 = max(0, -y1)
 
@@ -248,15 +342,19 @@ class SoilingModule(BaseOcclusionModule):
                 dst_y2 - dst_y1
             )
 
+            # -----------------------------------------------------
+            # Patch completely outside image
+            # -----------------------------------------------------
+
             if (
                 dst_x2 <= dst_x1
                 or dst_y2 <= dst_y1
             ):
                 continue
 
-            # -----------------------------------------------------
-            # Full-size RGB patch
-            # -----------------------------------------------------
+            # =====================================================
+            # Create full-frame patch
+            # =====================================================
 
             full_rgb = torch.zeros(
                 1,
@@ -276,6 +374,10 @@ class SoilingModule(BaseOcclusionModule):
                 dtype=dtype,
             )
 
+            # -----------------------------------------------------
+            # Put RGB texture into full-frame canvas
+            # -----------------------------------------------------
+
             full_rgb[
                 :,
                 :,
@@ -287,6 +389,10 @@ class SoilingModule(BaseOcclusionModule):
                 src_y1:src_y2,
                 src_x1:src_x2,
             ]
+
+            # -----------------------------------------------------
+            # Put alpha into full-frame canvas
+            # -----------------------------------------------------
 
             full_alpha[
                 :,
@@ -301,34 +407,36 @@ class SoilingModule(BaseOcclusionModule):
             ]
 
             # -----------------------------------------------------
-            # IMPORTANT DEBUG
+            # Debug before car mask
             # -----------------------------------------------------
 
             print(
-                f"[Soiling] patch {defect_idx + 1}/{num_defects}:"
-                f" pos=({cx},{cy})"
-                f" size=({rand_w},{rand_h})"
-                f" alpha_before_mask="
+                f"[Soiling] patch "
+                f"{defect_idx + 1}/{num_defects}: "
+                f"pos=({cx},{cy}) "
+                f"size=({rand_w},{rand_h}) "
+                f"alpha_before_mask="
                 f"{full_alpha.max().item():.3f}"
             )
 
-            # -----------------------------------------------------
+            # =====================================================
             # Apply car mask
-            # -----------------------------------------------------
+            # =====================================================
 
             full_alpha = (
-                full_alpha * car_mask
+                full_alpha * effective_car_mask
             )
 
             print(
-                f"[Soiling] patch {defect_idx + 1}:"
-                f" alpha_after_mask="
+                f"[Soiling] patch "
+                f"{defect_idx + 1}: "
+                f"alpha_after_mask="
                 f"{full_alpha.max().item():.3f}"
             )
 
-            # -----------------------------------------------------
-            # Expand patch RGB over batch
-            # -----------------------------------------------------
+            # =====================================================
+            # Expand RGB to batch
+            # =====================================================
 
             full_rgb = full_rgb.expand(
                 b,
@@ -337,27 +445,27 @@ class SoilingModule(BaseOcclusionModule):
                 -1,
             )
 
-            # -----------------------------------------------------
-            # Blend
-            # -----------------------------------------------------
+            # =====================================================
+            # Alpha blend
+            # =====================================================
 
             soil_texture = (
                 soil_texture * (1.0 - full_alpha)
                 + full_rgb * full_alpha
             )
 
-            # -----------------------------------------------------
-            # Mask
-            # -----------------------------------------------------
+            # =====================================================
+            # Update mask
+            # =====================================================
 
             soil_mask = torch.maximum(
                 soil_mask,
                 full_alpha,
             )
 
-        # ---------------------------------------------------------
-        # Final
-        # ---------------------------------------------------------
+        # =========================================================
+        # Final clamp
+        # =========================================================
 
         soil_texture = soil_texture.clamp(
             0.0,
@@ -370,16 +478,20 @@ class SoilingModule(BaseOcclusionModule):
         )
 
         print(
-            "[Soiling]"
-            f" final_mask="
-            f"({soil_mask.min().item():.3f},"
-            f"{soil_mask.max().item():.3f})"
-            f" final_image="
-            f"({soil_texture.min().item():.3f},"
+            "[Soiling] FINAL: "
+            f"mask=("
+            f"{soil_mask.min().item():.3f},"
+            f"{soil_mask.max().item():.3f}) "
+            f"image=("
+            f"{soil_texture.min().item():.3f},"
             f"{soil_texture.max().item():.3f})"
         )
 
         return soil_texture, soil_mask
+
+    # =============================================================
+    # Texture conversion
+    # =============================================================
 
     @staticmethod
     def _texture_to_tensor(
@@ -388,21 +500,28 @@ class SoilingModule(BaseOcclusionModule):
         dtype,
     ) -> torch.Tensor:
 
-        # =========================================================
-        # PIL
-        # =========================================================
+        # ---------------------------------------------------------
+        # PIL Image
+        # ---------------------------------------------------------
 
         if isinstance(item, Image.Image):
 
+            # Force RGBA
             item = item.convert("RGBA")
 
-            # .copy() is important:
-            # np.asarray(PIL) can return read-only memory.
+            # .copy() avoids PyTorch warning about read-only
+            # NumPy memory returned by np.asarray(PIL).
             arr = np.asarray(item).copy()
 
-            tex = torch.from_numpy(arr)
+            if arr.ndim != 3 or arr.shape[2] != 4:
+                raise ValueError(
+                    f"Expected RGBA texture, got {arr.shape}"
+                )
 
-            tex = tex.permute(
+            # HWC -> CHW
+            tex = torch.from_numpy(
+                arr
+            ).permute(
                 2,
                 0,
                 1,
@@ -410,29 +529,37 @@ class SoilingModule(BaseOcclusionModule):
 
             tex = tex.float() / 255.0
 
+            # CHW -> BCHW
             tex = tex.unsqueeze(0)
 
-        # =========================================================
+        # ---------------------------------------------------------
         # Tensor
-        # =========================================================
+        # ---------------------------------------------------------
 
         elif torch.is_tensor(item):
 
             tex = item
 
+            # CHW -> BCHW
             if tex.ndim == 3:
                 tex = tex.unsqueeze(0)
 
             if tex.ndim != 4:
                 raise ValueError(
-                    f"Texture must be [C,H,W] or [B,C,H,W], "
+                    "Texture tensor must be "
+                    "[C,H,W] or [B,C,H,W], "
                     f"got {tuple(tex.shape)}"
                 )
 
+            # One texture at a time
             if tex.shape[0] > 1:
                 tex = tex[:1]
 
             channels = tex.shape[1]
+
+            # -----------------------------------------------------
+            # RGB -> RGBA
+            # -----------------------------------------------------
 
             if channels == 3:
 
@@ -453,27 +580,45 @@ class SoilingModule(BaseOcclusionModule):
             elif channels != 4:
 
                 raise ValueError(
-                    f"Texture must have 3 or 4 channels, "
+                    "Texture tensor must have "
+                    "3 or 4 channels, "
                     f"got {channels}"
                 )
 
             tex = tex.float()
 
+            # uint8 / 0..255 -> 0..1
             if (
                 tex.numel() > 0
                 and tex.max() > 1.0
             ):
                 tex = tex / 255.0
 
+        # ---------------------------------------------------------
+        # Unsupported type
+        # ---------------------------------------------------------
+
         else:
 
             raise TypeError(
-                f"Unsupported texture type: {type(item)}"
+                f"Unsupported dirt texture type: "
+                f"{type(item)}. "
+                "Expected PIL.Image.Image "
+                "or torch.Tensor."
             )
+
+        # ---------------------------------------------------------
+        # Device / dtype / range
+        # ---------------------------------------------------------
 
         tex = tex.to(
             device=device,
             dtype=dtype,
         )
 
-        return tex.clamp(0.0, 1.0)
+        tex = tex.clamp(
+            0.0,
+            1.0,
+        )
+
+        return tex
