@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import kornia
@@ -13,82 +12,22 @@ from ..config import SoilingConfig
 from ..interfaces import BaseOcclusionModule
 
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
-
-@dataclass(frozen=True)
-class DirtAppearanceParams:
-    """
-    Resolved parameters for one dirt patch.
-
-    All values are in [0, 1] unless otherwise stated.
-
-    coverage
-        How much of the generated patch shape is actually occupied by dirt.
-
-    density
-        How dense the dirt is inside the occupied area.
-
-    opacity
-        Maximum optical opacity of the dirt body.
-
-    darkness
-        Darkness of the dirt material.
-
-    structure
-        Strength of texture-derived local variation.
-
-    edge_softness
-        Width/strength of the transition between dirt and clean image.
-
-    opaque_core
-        Fraction/strength of the patch that can become truly opaque.
-
-    residue
-        Amount of thin semi-transparent dirt around the main body.
-    """
-
-    coverage: float
-    density: float
-    opacity: float
-    darkness: float
-    structure: float
-    edge_softness: float
-    opaque_core: float
-    residue: float
-
-
-# ============================================================================
-# Soiling Module
-# ============================================================================
-
-
 class SoilingModule(BaseOcclusionModule):
     """
-    Camera/lens soiling augmentation.
+    Generates a dirt/soiling mask.
 
-    The module intentionally separates:
+    The module does NOT modify the input image.
+
+    The only user-facing control is:
 
         intensity
-            How much dirt is generated:
-            number and size of patches.
+            Controls the amount of dirt:
+            - number of patches
+            - patch size
+            - overall coverage
 
-    severity
-        Controls the visual strength of contamination:
-        opacity and darkness.
-
-        severity=0.0 -> almost invisible
-        severity=0.25 -> light dirt
-        severity=0.5 -> visible dirt
-        severity=0.75 -> dense dirt
-        severity=1.0 -> fully opaque / nearly black mud patches
-
-    Dirt textures use RGB for spatial structure and Alpha for shape.
-    RGB is not pasted directly as a sticker. Its luminance is used to
-    extract lumps/cracks, which are then rendered using synthesized
-    dark mud colors.
+    The dirt texture alpha defines the actual shape and local density
+    of each dirt patch.
 
     Expected image:
         [B, 3, H, W], float, nominally in [0, 1]
@@ -98,13 +37,31 @@ class SoilingModule(BaseOcclusionModule):
             [C, H, W]
             [B, C, H, W]
 
+        For RGB textures:
+            alpha is assumed to be 1 everywhere.
+
+        For RGBA textures:
+            alpha is used as the dirt mask.
+
     Returned:
         result:
-            [B, 3, H, W]
+            The original image, unchanged.
 
         soil_mask:
-            [B, 1, H, W]
-            Actual optical opacity applied to the image.
+            [B, 1, H, W], float in [0, 1].
+
+            0.0 = no dirt
+            1.0 = fully occupied dirt
+
+    Important:
+        This class intentionally does NOT:
+            - render dirt colors
+            - composite dirt onto the image
+            - use severity
+            - use darkness
+            - use opacity randomness
+            - use DirtAppearanceParams
+            - modify the image
     """
 
     # ------------------------------------------------------------------
@@ -121,12 +78,12 @@ class SoilingModule(BaseOcclusionModule):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
+        self._validate_image(image)
+
         if self._is_disabled(cfg):
             return (
                 image,
-                torch.zeros_like(
-                    image[:, 0:1]
-                ),
+                torch.zeros_like(image[:, :1]),
             )
 
         dirt_buffer = self._resolve_dirt_buffer(
@@ -134,10 +91,7 @@ class SoilingModule(BaseOcclusionModule):
             kwargs=kwargs,
         )
 
-        self._validate_image(image)
-
         batch_size, _, height, width = image.shape
-
         device = image.device
         dtype = image.dtype
 
@@ -145,28 +99,13 @@ class SoilingModule(BaseOcclusionModule):
             float(cfg.intensity)
         )
 
-        severity = self._get_severity(cfg)
-
-        result = (
-            image[:, :3]
-            .clamp(0.0, 1.0)
-            .clone()
-        )
-
-        effective_car_mask = (
-            self._prepare_car_mask(
-                car_mask=car_mask,
-                batch_size=batch_size,
-                height=height,
-                width=width,
-                device=device,
-                dtype=dtype,
-            )
-        )
-
-        num_patches = self._get_num_patches(
-            intensity=intensity,
-            severity=severity,
+        effective_car_mask = self._prepare_car_mask(
+            car_mask=car_mask,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            device=device,
+            dtype=dtype,
         )
 
         soil_mask = torch.zeros(
@@ -178,109 +117,34 @@ class SoilingModule(BaseOcclusionModule):
             dtype=dtype,
         )
 
+        num_patches = self._get_num_patches(
+            intensity=intensity,
+        )
+
         for _ in range(num_patches):
             patch = self._create_patch(
                 dirt_buffer=dirt_buffer,
                 image_height=height,
                 image_width=width,
                 intensity=intensity,
-                severity=severity,
-                params=params,
                 device=device,
                 dtype=dtype,
             )
 
-            center_x, center_y = patch["center"]
-
-            patch_h, patch_w = patch["texture_rgb"].shape[-2:]
-
-            x1 = center_x - patch_w // 2
-            y1 = center_y - patch_h // 2
-            x2 = x1 + patch_w
-            y2 = y1 + patch_h
-
-            dst_x1, dst_y1 = max(0, x1), max(0, y1)
-            dst_x2, dst_y2 = min(width, x2), min(height, y2)
-
-            src_x1, src_y1 = max(0, -x1), max(0, -y1)
-            src_x2 = src_x1 + (dst_x2 - dst_x1)
-            src_y2 = src_y1 + (dst_y2 - dst_y1)
-
-            if dst_x2 <= dst_x1 or dst_y2 <= dst_y1:
-                continue
-
-            # ----------------------------------------------------------
-            # Place alpha
-            # ----------------------------------------------------------
-
-            full_alpha = torch.zeros(
-                batch_size,
-                1,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
+            self._place_patch(
+                soil_mask=soil_mask,
+                patch=patch,
+                image_height=height,
+                image_width=width,
             )
 
-            full_alpha[
-                :,
-                :,
-                dst_y1:dst_y2,
-                dst_x1:dst_x2,
-            ] = patch["alpha"][
-                :,
-                :,
-                src_y1:src_y2,
-                src_x1:src_x2,
-            ]
+        # Dirt is allowed only on the valid vehicle/image region.
+        soil_mask.mul_(effective_car_mask)
 
-            full_alpha = self._apply_car_mask(
-                full_alpha,
-                effective_car_mask,
-            )
-
-            # ----------------------------------------------------------
-            # Place RGB texture
-            # ----------------------------------------------------------
-
-            full_texture_rgb = torch.zeros_like(result)
-
-            full_texture_rgb[
-                :,
-                :,
-                dst_y1:dst_y2,
-                dst_x1:dst_x2,
-            ] = patch["texture_rgb"][
-                :,
-                :,
-                src_y1:src_y2,
-                src_x1:src_x2,
-            ]
-
-            # ----------------------------------------------------------
-            # Generate synthesized dirt appearance
-            # ----------------------------------------------------------
-
-            dirty_image = self._create_dirty_image(
-                image=result,
-                texture_rgb=full_texture_rgb,
-                severity=severity,
-            )
-
-            result = self._composite(
-                image=result,
-                dirty_image=dirty_image,
-                alpha=full_alpha,
-            )
-
-            # GT mask represents actual applied optical opacity.
-            soil_mask = torch.maximum(
-                soil_mask,
-                full_alpha,
-            )
-
+        # Important:
+        # The image itself is completely untouched.
         return (
-            result.clamp(0.0, 1.0),
+            image,
             soil_mask.clamp(0.0, 1.0),
         )
 
@@ -290,21 +154,27 @@ class SoilingModule(BaseOcclusionModule):
 
     @staticmethod
     def _is_disabled(cfg: SoilingConfig) -> bool:
-        return not cfg.enabled or float(cfg.intensity) <= 0.0
-
-    @staticmethod
-    def _get_severity(cfg: SoilingConfig) -> float:
-        severity = getattr(cfg, "severity", 0.5)
-        return max(0.0, min(1.0, float(severity)))
+        return (
+            not cfg.enabled
+            or float(cfg.intensity) <= 0.0
+        )
 
     @staticmethod
     def _clamp01(value: float) -> float:
-        return max(0.0, min(1.0, value))
+        return max(
+            0.0,
+            min(1.0, value),
+        )
 
     @staticmethod
-    def _resolve_dirt_buffer(dirt_buffer, kwargs: dict):
+    def _resolve_dirt_buffer(
+        dirt_buffer,
+        kwargs: dict,
+    ):
         if dirt_buffer is None:
-            dirt_buffer = kwargs.get("dirt_textures")
+            dirt_buffer = kwargs.get(
+                "dirt_textures"
+            )
 
         if dirt_buffer is None or len(dirt_buffer) == 0:
             raise RuntimeError(
@@ -314,43 +184,66 @@ class SoilingModule(BaseOcclusionModule):
 
         return dirt_buffer
 
+    # ------------------------------------------------------------------
+    # Patch count
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _get_num_patches(
         intensity: float,
-        severity: float,
     ) -> int:
-        base_count = int(round(2.0 + intensity * 8.0))
+        """
+        Number of dirt patches.
 
-        # Severity has only a small effect on count.
-        # It does NOT affect opacity.
-        severity_bonus = int(round(severity * 2.0))
+        intensity=0:
+            no patches
 
-        return max(1, base_count + severity_bonus)
+        intensity=1:
+            maximum number of patches
+        """
+
+        min_patches = 1
+        max_patches = 10
+
+        count = round(
+            min_patches
+            + (max_patches - min_patches)
+            * intensity
+        )
+
+        return max(
+            1,
+            int(count),
+        )
 
     # ------------------------------------------------------------------
     # Image validation
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _validate_image(image: torch.Tensor) -> None:
+    def _validate_image(
+        image: torch.Tensor,
+    ) -> None:
+
         if image.ndim != 4:
             raise ValueError(
-                "SoilingModule expects image with shape "
-                f"[B, C, H, W], got {tuple(image.shape)}"
+                "SoilingModule expects image "
+                "with shape [B, C, H, W], "
+                f"got {tuple(image.shape)}"
             )
 
         if image.shape[1] < 3:
             raise ValueError(
-                "SoilingModule expects at least 3 image channels, "
-                f"got {image.shape[1]}"
+                "SoilingModule expects at least "
+                f"3 image channels, got {image.shape[1]}"
             )
 
     # ------------------------------------------------------------------
     # Car mask
     # ------------------------------------------------------------------
 
+    @staticmethod
     def _prepare_car_mask(
-        self,
         car_mask: torch.Tensor | None,
         batch_size: int,
         height: int,
@@ -370,25 +263,27 @@ class SoilingModule(BaseOcclusionModule):
             )
 
         if car_mask.ndim == 3:
-            car_mask = car_mask.unsqueeze(
-                1
-            )
+            car_mask = car_mask.unsqueeze(1)
 
         if car_mask.ndim != 4:
             raise ValueError(
-                "car_mask must have shape [B, 1, H, W] or [B, H, W], "
+                "car_mask must have shape "
+                "[B, 1, H, W] or [B, H, W], "
                 f"got {tuple(car_mask.shape)}"
             )
 
         if car_mask.shape[0] != batch_size:
             raise ValueError(
-                "car_mask batch size does not match image: "
-                f"{car_mask.shape[0]} != {batch_size}"
+                "car_mask batch size does not match "
+                f"image: {car_mask.shape[0]} != {batch_size}"
             )
 
         car_mask = car_mask[:, :1]
 
-        if car_mask.shape[-2:] != (height, width):
+        if car_mask.shape[-2:] != (
+            height,
+            width,
+        ):
             car_mask = F.interpolate(
                 car_mask.float(),
                 size=(height, width),
@@ -398,10 +293,17 @@ class SoilingModule(BaseOcclusionModule):
         car_mask = car_mask.to(
             device=device,
             dtype=dtype,
-        ).clamp(0.0, 1.0)
+        ).clamp(
+            0.0,
+            1.0,
+        )
 
+        # Preserve previous fallback behavior:
+        # an empty mask means "no restriction".
         if car_mask.max() <= 0:
-            return torch.ones_like(car_mask)
+            return torch.ones_like(
+                car_mask
+            )
 
         return car_mask
 
@@ -415,8 +317,6 @@ class SoilingModule(BaseOcclusionModule):
         image_height: int,
         image_width: int,
         intensity: float,
-        severity: float,
-        params: DirtAppearanceParams,
         device: torch.device,
         dtype: torch.dtype,
     ) -> dict[str, Any]:
@@ -427,12 +327,13 @@ class SoilingModule(BaseOcclusionModule):
             dtype=dtype,
         )
 
-        patch_height, patch_width = self._sample_patch_size(
-            image_height=image_height,
-            image_width=image_width,
-            intensity=intensity,
-            severity=severity,
-            device=device,
+        patch_height, patch_width = (
+            self._sample_patch_size(
+                image_height=image_height,
+                image_width=image_width,
+                intensity=intensity,
+                device=device,
+            )
         )
 
         texture = self._resize_texture(
@@ -446,20 +347,12 @@ class SoilingModule(BaseOcclusionModule):
             device=device,
         )
 
-        texture_rgb = texture[:, :3]
         alpha = texture[:, 3:4]
 
-        # Preserve the texture shape, then apply severity as the
-        # single global strength control.
-        alpha = self._soften_alpha(
+        # Process the texture alpha into a clean continuous mask.
+        alpha = self._process_alpha(
             alpha=alpha,
             device=device,
-            severity=severity,
-        )
-
-        alpha, opacity = self._apply_severity_opacity(
-            alpha=alpha,
-            severity=severity,
         )
 
         center = self._sample_patch_center(
@@ -471,294 +364,14 @@ class SoilingModule(BaseOcclusionModule):
         return {
             "alpha": alpha,
             "center": center,
-            "strength": opacity,
-            "texture_rgb": texture_rgb,
         }
-
-    # ------------------------------------------------------------------
-    # Alpha generation
-    # ------------------------------------------------------------------
-
-    def _build_dirt_alpha(
-        self,
-        texture_alpha: torch.Tensor,
-        params: DirtAppearanceParams,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Generates a continuous optical opacity field.
-
-        This is intentionally NOT a binary mask generator.
-
-        The resulting alpha consists of:
-
-            1. soft dirt body
-            2. dense internal regions
-            3. optional opaque core
-            4. thin residue around the body
-        """
-
-        source = texture_alpha.clamp(
-            0.0,
-            1.0,
-        )
-
-        source_max = source.amax(
-            dim=(-2, -1),
-            keepdim=True,
-        )
-
-        shape = (
-            source
-            / (source_max + 1e-6)
-        ).clamp(
-            0.0,
-            1.0,
-        )
-
-        # --------------------------------------------------------------
-        # Base smoothing
-        # --------------------------------------------------------------
-
-        image_size = min(
-            shape.shape[-2],
-            shape.shape[-1],
-        )
-
-        kernel = self._sample_odd_kernel(
-            image_size=image_size,
-            low=3,
-            high=9,
-            device=device,
-        )
-
-        sigma = (
-            0.5
-            + 1.8 * params.edge_softness
-        )
-
-        smooth_shape = (
-            kornia.filters
-            .gaussian_blur2d(
-                shape,
-                kernel_size=(
-                    kernel,
-                    kernel,
-                ),
-                sigma=(
-                    sigma,
-                    sigma,
-                ),
-            )
-        )
-
-        smooth_shape = smooth_shape.clamp(
-            0.0,
-            1.0,
-        )
-
-        # --------------------------------------------------------------
-        # Coverage
-        # --------------------------------------------------------------
-
-        # Coverage does not simply multiply alpha.
-        # It changes how much of the shape is considered actual dirt.
-
-        coverage_threshold = (
-            0.95
-            - 0.90 * params.coverage
-        )
-
-        coverage_threshold = max(
-            0.05,
-            min(
-                0.95,
-                coverage_threshold,
-            ),
-        )
-
-        coverage_mask = (
-            smooth_shape
-            >= coverage_threshold
-        ).to(
-            dtype=smooth_shape.dtype
-        )
-
-        # Make coverage continuous instead of binary.
-        coverage_field = (
-            smooth_shape
-            * coverage_mask
-        )
-
-        # --------------------------------------------------------------
-        # Density
-        # --------------------------------------------------------------
-
-        # Density controls how much of the interior is filled.
-        #
-        # Instead of random per-pixel noise, use low-frequency noise
-        # so the result looks like actual mud clumps.
-
-        low_freq_noise = self._generate_low_frequency_noise(
-            shape=shape,
-            device=device,
-            dtype=shape.dtype,
-        )
-
-        density_field = (
-            0.65
-            + 0.35 * low_freq_noise
-        )
-
-        density_field = (
-            density_field
-            * params.density
-            + (1.0 - params.density)
-        )
-
-        body = (
-            coverage_field
-            * density_field
-        )
-
-        # --------------------------------------------------------------
-        # Base opacity
-        # --------------------------------------------------------------
-
-        alpha = (
-            body
-            * params.opacity
-        )
-
-        # --------------------------------------------------------------
-        # Opaque core
-        # --------------------------------------------------------------
-
-        if params.opaque_core > 0.0:
-
-            core_threshold = (
-                0.90
-                - 0.75 * params.opaque_core
-            )
-
-            core_threshold = max(
-                0.10,
-                min(
-                    0.90,
-                    core_threshold,
-                ),
-            )
-
-            core = (
-                smooth_shape
-                >= core_threshold
-            ).to(
-                dtype=smooth_shape.dtype
-            )
-
-            # Do not make the whole blob binary.
-            #
-            # opaque_core determines the strength of the core,
-            # while the shape itself determines where it can exist.
-
-            core_strength = (
-                params.opaque_core
-            )
-
-            alpha = torch.maximum(
-                alpha,
-                core * core_strength,
-            )
-
-        # --------------------------------------------------------------
-        # Thin residue
-        # --------------------------------------------------------------
-
-        if params.residue > 0.0:
-
-            residue_threshold = (
-                0.20
-                + 0.30 * params.coverage
-            )
-
-            residue_mask = (
-                smooth_shape
-                > residue_threshold
-            ).to(
-                dtype=smooth_shape.dtype
-            )
-
-            residue_alpha = (
-                smooth_shape
-                * params.residue
-                * 0.35
-                * residue_mask
-            )
-
-            alpha = torch.maximum(
-                alpha,
-                residue_alpha,
-            )
-
-        return alpha.clamp(
-            0.0,
-            1.0,
-        )
-
-    # ------------------------------------------------------------------
-    # Low-frequency structure
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _generate_low_frequency_noise(
-        shape: torch.Tensor,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-
-        height = shape.shape[-2]
-        width = shape.shape[-1]
-
-        noise_h = max(
-            2,
-            height // 12,
-        )
-
-        noise_w = max(
-            2,
-            width // 12,
-        )
-
-        noise = torch.rand(
-            shape.shape[0],
-            1,
-            noise_h,
-            noise_w,
-            device=device,
-            dtype=dtype,
-        )
-
-        noise = F.interpolate(
-            noise,
-            size=(
-                height,
-                width,
-            ),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        return noise.clamp(
-            0.0,
-            1.0,
-        )
 
     # ------------------------------------------------------------------
     # Texture sampling
     # ------------------------------------------------------------------
 
+    @staticmethod
     def _sample_texture(
-        self,
         dirt_buffer,
         device: torch.device,
         dtype: torch.dtype,
@@ -771,7 +384,7 @@ class SoilingModule(BaseOcclusionModule):
             device=device,
         ).item()
 
-        return self._texture_to_tensor(
+        return SoilingModule._texture_to_tensor(
             item=dirt_buffer[index],
             device=device,
             dtype=dtype,
@@ -786,20 +399,33 @@ class SoilingModule(BaseOcclusionModule):
         image_height: int,
         image_width: int,
         intensity: float,
-        severity: float,
-        coverage: float,
         device: torch.device,
     ) -> tuple[int, int]:
+        """
+        Intensity controls patch size.
 
-        base_size = min(image_height, image_width)
+        Low intensity:
+            small dirt spots
 
-        min_scale = 0.035 + 0.015 * severity
+        High intensity:
+            larger dirt blobs
+        """
+
+        base_size = min(
+            image_height,
+            image_width,
+        )
+
+        min_scale = 0.025
+
+        max_scale = (
+            0.12
+            + 0.48 * intensity
+        )
 
         max_scale = min(
-            0.80,
-            0.20
-            + 0.28 * intensity
-            + 0.22 * coverage,
+            0.75,
+            max_scale,
         )
 
         max_scale = max(
@@ -830,18 +456,38 @@ class SoilingModule(BaseOcclusionModule):
 
         patch_width = max(
             8,
-            int(patch_height * aspect),
+            int(
+                patch_height * aspect
+            ),
+        )
+
+        max_height = max(
+            8,
+            int(
+                image_height * 0.80
+            ),
+        )
+
+        max_width = max(
+            8,
+            int(
+                image_width * 0.80
+            ),
+        )
+
+        patch_height = min(
+            patch_height,
+            max_height,
+        )
+
+        patch_width = min(
+            patch_width,
+            max_width,
         )
 
         return (
-            min(
-                patch_height,
-                int(image_height * 0.75),
-            ),
-            min(
-                patch_width,
-                int(image_width * 0.75),
-            ),
+            patch_height,
+            patch_width,
         )
 
     @staticmethod
@@ -875,7 +521,10 @@ class SoilingModule(BaseOcclusionModule):
 
         return F.interpolate(
             texture,
-            size=(height, width),
+            size=(
+                height,
+                width,
+            ),
             mode="bilinear",
             align_corners=False,
         )
@@ -901,10 +550,17 @@ class SoilingModule(BaseOcclusionModule):
         if abs(angle) < 0.1:
             return texture
 
-        batch_size, _, height, width = texture.shape
+        batch_size, _, height, width = (
+            texture.shape
+        )
 
         center = torch.tensor(
-            [[width / 2.0, height / 2.0]],
+            [
+                [
+                    width / 2.0,
+                    height / 2.0,
+                ]
+            ],
             device=device,
             dtype=texture.dtype,
         )
@@ -923,253 +579,212 @@ class SoilingModule(BaseOcclusionModule):
         )
 
         rotation_matrix = (
-            kornia.geometry.transform.get_rotation_matrix2d(
+            kornia.geometry.transform
+            .get_rotation_matrix2d(
                 center=center,
                 angle=angle_tensor,
                 scale=scale,
             )
         )
 
-        return kornia.geometry.transform.warp_affine(
-            texture,
-            rotation_matrix,
-            dsize=(height, width),
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=False,
+        return (
+            kornia.geometry.transform
+            .warp_affine(
+                texture,
+                rotation_matrix,
+                dsize=(
+                    height,
+                    width,
+                ),
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
         )
 
     # ------------------------------------------------------------------
     # Alpha processing
     # ------------------------------------------------------------------
 
-    def _soften_alpha(
-        self,
+    @staticmethod
+    def _process_alpha(
         alpha: torch.Tensor,
         device: torch.device,
-        severity: float,
     ) -> torch.Tensor:
+        """
+        Converts texture alpha into the dirt mask.
+
+        Important:
+            We DO NOT normalize alpha to its local maximum.
+
+        This preserves the original density information of the dirt
+        texture.
+
+        The only processing is spatial smoothing.
+        """
+
+        alpha = alpha.clamp(
+            0.0,
+            1.0,
+        )
 
         image_size = min(
             alpha.shape[-2],
             alpha.shape[-1],
         )
 
-        kernel = self._sample_odd_kernel(
+        kernel = SoilingModule._sample_odd_kernel(
             image_size=image_size,
-            low=7,
-            high=31,
+            low=3,
+            high=11,
             device=device,
         )
 
-        sigma_min = 2.0 - 0.5 * severity
-        sigma_max = 7.0 - 1.5 * severity
-
-        sigma = torch.empty(
-            1,
-            device=device,
-        ).uniform_(
-            sigma_min,
-            sigma_max,
-        ).item()
+        sigma = 1.0
 
         alpha = kornia.filters.gaussian_blur2d(
             alpha,
-            kernel_size=(kernel, kernel),
-            sigma=(sigma, sigma),
+            kernel_size=(
+                kernel,
+                kernel,
+            ),
+            sigma=(
+                sigma,
+                sigma,
+            ),
         )
 
-        # Normalize only the SHAPE of the texture.
-        #
-        # The actual opacity is applied separately in
-        # _apply_severity_opacity().
-        alpha_max = alpha.amax(
-            dim=(-2, -1),
-            keepdim=True,
-        )
-
-        alpha = alpha / (alpha_max + 1e-6)
-
-        return alpha.clamp(0.0, 1.0)
-
-    @staticmethod
-    def _apply_severity_opacity(
-        alpha: torch.Tensor,
-        severity: float,
-    ) -> tuple[torch.Tensor, float]:
-        """
-        Severity is the ONLY global opacity control.
-
-        Mapping:
-
-            severity=0.0  -> 0.0
-            severity=0.25 -> ~0.125
-            severity=0.5  -> ~0.354
-            severity=0.75 -> ~0.650
-            severity=1.0  -> 1.0
-
-        The exponent can be lowered if more opacity is desired
-        at medium severity.
-        """
-
-        opacity = severity ** 1.5
-
-        opacity = min(
+        return alpha.clamp(
+            0.0,
             1.0,
-            max(0.0, opacity),
         )
-
-        alpha = (
-            alpha * opacity
-        ).clamp(0.0, 1.0)
-
-        return alpha, float(opacity)
 
     # ------------------------------------------------------------------
-    # Dirty appearance
-    # ------------------------------------------------------------------
-
-    def _create_dirty_image(
-        self,
-        image: torch.Tensor,
-        texture_rgb: torch.Tensor,
-        severity: float,
-    ) -> torch.Tensor:
-        """
-        Generates synthesized dirt appearance.
-
-        Severity controls darkness independently from alpha.
-
-        The RGB texture provides spatial structure:
-        lumps, gradients and cracks.
-
-        The RGB texture itself is never pasted directly.
-        """
-
-        # --------------------------------------------------------------
-        # 1. Extract spatial structure from RGB texture
-        # --------------------------------------------------------------
-
-        structure = (
-            luminance * 0.65
-            + detail * 0.35
-        )
-
-        # Small micro variation.
-        structure = (
-            structure
-            + torch.rand_like(structure) * 0.08
-        ).clamp(0.0, 1.0)
-
-        # --------------------------------------------------------------
-        # 2. Generate mud base color
-        # --------------------------------------------------------------
-
-        base_r = torch.empty(
-            1,
-            device=image.device,
-        ).uniform_(
-            0.15,
-            0.28,
-        ).item()
-
-        base_g = torch.empty(
-            1,
-            device=image.device,
-        ).uniform_(
-            0.13,
-            0.25,
-        ).item()
-
-        base_b = torch.empty(
-            1,
-            device=image.device,
-        ).uniform_(
-            0.10,
-            0.22,
-        ).item()
-
-        base_color = torch.tensor(
-            [[base_r, base_g, base_b]],
-            device=image.device,
-            dtype=image.dtype,
-        ).view(
-            1,
-            3,
-            1,
-            1,
-        )
-
-        # --------------------------------------------------------------
-        # Darkness
-        # --------------------------------------------------------------
-        #
-        # Low severity:
-        #   lighter/translucent-looking dirt
-        #
-        # High severity:
-        #   very dark mud
-        #
-        # At severity=1 the base becomes very dark but not numerically
-        # black, which allows the texture structure to remain visible.
-
-        darkness = severity ** 1.2
-
-        brightness = (
-            1.0
-            - 0.88 * params.darkness
-        )
-
-        brightness = max(
-            0.10,
-            brightness,
-        )
-
-        base_color = base_color * brightness
-
-        # --------------------------------------------------------------
-        # 4. Apply texture structure
-        # --------------------------------------------------------------
-
-        # Darker regions correspond to cracks/deeper parts.
-        dirt_appearance = base_color * (
-            0.35 + 0.65 * structure
-        )
-
-        return dirt.expand_as(
-            image
-        ).clamp(0.0, 1.0)
-
-    # ------------------------------------------------------------------
-    # Compositing
+    # Patch placement
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _composite(
-        image: torch.Tensor,
-        dirty_image: torch.Tensor,
-        alpha: torch.Tensor,
-    ) -> torch.Tensor:
+    def _place_patch(
+        soil_mask: torch.Tensor,
+        patch: dict[str, Any],
+        image_height: int,
+        image_width: int,
+    ) -> None:
 
-        return (
-            image * (1.0 - alpha)
-            + dirty_image * alpha
+        alpha = patch["alpha"]
+        center_x, center_y = patch["center"]
+
+        patch_height = alpha.shape[-2]
+        patch_width = alpha.shape[-1]
+
+        x1 = (
+            center_x
+            - patch_width // 2
+        )
+
+        y1 = (
+            center_y
+            - patch_height // 2
+        )
+
+        x2 = x1 + patch_width
+        y2 = y1 + patch_height
+
+        dst_x1 = max(
+            0,
+            x1,
+        )
+
+        dst_y1 = max(
+            0,
+            y1,
+        )
+
+        dst_x2 = min(
+            image_width,
+            x2,
+        )
+
+        dst_y2 = min(
+            image_height,
+            y2,
+        )
+
+        src_x1 = max(
+            0,
+            -x1,
+        )
+
+        src_y1 = max(
+            0,
+            -y1,
+        )
+
+        src_x2 = (
+            src_x1
+            + (
+                dst_x2
+                - dst_x1
+            )
+        )
+
+        src_y2 = (
+            src_y1
+            + (
+                dst_y2
+                - dst_y1
+            )
+        )
+
+        if (
+            dst_x2 <= dst_x1
+            or dst_y2 <= dst_y1
+        ):
+            return
+
+        patch_alpha = alpha[
+            :,
+            :,
+            src_y1:src_y2,
+            src_x1:src_x2,
+        ]
+
+        # Multiple dirt patches accumulate as coverage.
+        #
+        # This is different from simply using maximum alpha:
+        #
+        #   old + new * (1 - old)
+        #
+        # means overlapping dirt becomes denser.
+        #
+        # The result remains in [0, 1].
+
+        existing = soil_mask[
+            :,
+            :,
+            dst_y1:dst_y2,
+            dst_x1:dst_x2,
+        ]
+
+        combined = (
+            existing
+            + patch_alpha
+            * (1.0 - existing)
+        )
+
+        soil_mask[
+            :,
+            :,
+            dst_y1:dst_y2,
+            dst_x1:dst_x2,
+        ] = combined.clamp(
+            0.0,
+            1.0,
         )
 
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _apply_car_mask(
-        alpha: torch.Tensor,
-        car_mask: torch.Tensor,
-    ) -> torch.Tensor:
-
-        return (
-            alpha
-            * car_mask
-        )
 
     @staticmethod
     def _sample_odd_kernel(
@@ -1179,9 +794,15 @@ class SoilingModule(BaseOcclusionModule):
         device: torch.device,
     ) -> int:
 
+        if image_size < 3:
+            return 3
+
         max_allowed = max(
             3,
-            min(high, image_size - 1),
+            min(
+                high,
+                image_size - 1,
+            ),
         )
 
         if max_allowed % 2 == 0:
@@ -1199,7 +820,11 @@ class SoilingModule(BaseOcclusionModule):
             return max_allowed
 
         count = (
-            (max_allowed - min_allowed) // 2
+            (
+                max_allowed
+                - min_allowed
+            )
+            // 2
         ) + 1
 
         index = torch.randint(
@@ -1209,7 +834,10 @@ class SoilingModule(BaseOcclusionModule):
             device=device,
         ).item()
 
-        return min_allowed + index * 2
+        return (
+            min_allowed
+            + index * 2
+        )
 
     # ------------------------------------------------------------------
     # Texture conversion
@@ -1222,39 +850,59 @@ class SoilingModule(BaseOcclusionModule):
         dtype: torch.dtype,
     ) -> torch.Tensor:
 
-        if isinstance(item, Image.Image):
-            item = item.convert("RGBA")
+        if isinstance(
+            item,
+            Image.Image,
+        ):
+            item = item.convert(
+                "RGBA"
+            )
 
-            array = np.asarray(item).copy()
+            array = np.asarray(
+                item
+            ).copy()
 
             texture = (
-                torch.from_numpy(array)
-                .permute(2, 0, 1)
+                torch.from_numpy(
+                    array
+                )
+                .permute(
+                    2,
+                    0,
+                    1,
+                )
                 .contiguous()
                 .float()
                 / 255.0
             )
 
-            texture = texture.unsqueeze(0)
+            texture = texture.unsqueeze(
+                0
+            )
 
         elif torch.is_tensor(item):
+
             texture = item
 
             if texture.ndim == 3:
-                texture = texture.unsqueeze(0)
+                texture = texture.unsqueeze(
+                    0
+                )
 
             if texture.ndim != 4:
                 raise ValueError(
-                    "Texture must have shape [C,H,W] or [B,C,H,W], "
+                    "Texture must have shape "
+                    "[C,H,W] or [B,C,H,W], "
                     f"got {tuple(texture.shape)}"
                 )
 
-            # Take one texture per patch.
+            # One texture per patch.
             texture = texture[:1]
 
             channels = texture.shape[1]
 
             if channels == 3:
+
                 alpha = torch.ones(
                     texture.shape[0],
                     1,
@@ -1265,13 +913,18 @@ class SoilingModule(BaseOcclusionModule):
                 )
 
                 texture = torch.cat(
-                    [texture, alpha],
+                    [
+                        texture,
+                        alpha,
+                    ],
                     dim=1,
                 )
 
             elif channels != 4:
+
                 raise ValueError(
-                    "Texture must contain 3 or 4 channels, "
+                    "Texture must contain "
+                    "3 or 4 channels, "
                     f"got {channels}"
                 )
 
@@ -1281,14 +934,20 @@ class SoilingModule(BaseOcclusionModule):
                 texture.numel() > 0
                 and texture.max() > 1.0
             ):
-                texture = texture / 255.0
+                texture = (
+                    texture / 255.0
+                )
 
         else:
             raise TypeError(
-                f"Unsupported dirt texture type: {type(item)}"
+                "Unsupported dirt texture "
+                f"type: {type(item)}"
             )
 
         return texture.to(
             device=device,
             dtype=dtype,
-        ).clamp(0.0, 1.0)
+        ).clamp(
+            0.0,
+            1.0,
+        )
