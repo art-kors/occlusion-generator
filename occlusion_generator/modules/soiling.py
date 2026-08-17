@@ -290,4 +290,4 @@ class SoilingModule(BaseOcclusionModule):
             soil_mask *= car_mask
 
         # The module is a pure mask generator.
-        return image, soil_maskм
+        return image, soil_mask
