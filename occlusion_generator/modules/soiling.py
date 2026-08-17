@@ -15,12 +15,12 @@ class SoilingModule(BaseOcclusionModule):
     _MAX_PATCHES = 32
 
     @staticmethod
-    def _texture_to_rgba(
+    def _texture_to_rgb(
         texture: Any,
         device: torch.device,
     ) -> torch.Tensor:
         if isinstance(texture, Image.Image):
-            image = texture.convert("RGBA")
+            image = texture.convert("RGB")
             array = np.array(image, copy=True)
 
             tensor = (
@@ -62,27 +62,17 @@ class SoilingModule(BaseOcclusionModule):
         channels = tensor.shape[0]
 
         if channels == 1:
-            rgb = tensor.repeat(3, 1, 1)
-            alpha = torch.ones_like(tensor)
-
-        elif channels == 3:
-            rgb = tensor
-            alpha = torch.ones(
-                (1, tensor.shape[1], tensor.shape[2]),
-                device=device,
-                dtype=torch.float32,
-            )
+            tensor = tensor.repeat(3, 1, 1)
 
         elif channels == 4:
-            rgb = tensor[:3]
-            alpha = tensor[3:4]
+            tensor = tensor[:3]
 
-        else:
+        elif channels != 3:
             raise ValueError(
                 f"Texture must have 1, 3 or 4 channels, got {channels}"
             )
 
-        return torch.cat((rgb, alpha), dim=0)
+        return tensor
 
     def apply(
         self,
@@ -94,22 +84,12 @@ class SoilingModule(BaseOcclusionModule):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        if image.ndim != 4:
-            raise ValueError(
-                f"`image` must have shape [B,C,H,W], got {tuple(image.shape)}"
-            )
-
         batch_size, channels, height, width = image.shape
-
-        if channels not in (1, 3, 4):
-            raise ValueError(
-                f"`image` must have 1, 3 or 4 channels, got {channels}"
-            )
 
         device = image.device
         dtype = image.dtype
 
-        dirty_image = image.clone()
+        result = image.clone()
 
         soil_mask = torch.zeros(
             (batch_size, 1, height, width),
@@ -118,48 +98,18 @@ class SoilingModule(BaseOcclusionModule):
         )
 
         if dirt_buffer is None or len(dirt_buffer) == 0:
-            return dirty_image, soil_mask
+            return result, soil_mask
 
         intensity = float(cfg.intensity)
         intensity = max(0.0, min(1.0, intensity))
 
         if intensity <= 0.0:
-            return dirty_image, soil_mask
+            return result, soil_mask
 
         num_patches = max(
             1,
             int(round(self._MAX_PATCHES * intensity)),
         )
-
-        if car_mask is not None:
-            if car_mask.ndim == 3:
-                car_mask = car_mask.unsqueeze(1)
-
-            if car_mask.ndim != 4:
-                raise ValueError(
-                    "`car_mask` must have shape [B,1,H,W] "
-                    f"or [B,H,W], got {tuple(car_mask.shape)}"
-                )
-
-            if car_mask.shape[0] != batch_size:
-                raise ValueError(
-                    "Batch size mismatch between image and car_mask: "
-                    f"{batch_size} vs {car_mask.shape[0]}"
-                )
-
-            if car_mask.shape[-2:] != (height, width):
-                car_mask = F.interpolate(
-                    car_mask.float(),
-                    size=(height, width),
-                    mode="nearest",
-                )
-
-            car_mask = car_mask.to(
-                device=device,
-                dtype=torch.float32,
-            ).clamp(0.0, 1.0)
-
-        generator = kwargs.get("generator")
 
         for batch_idx in range(batch_size):
             for _ in range(num_patches):
@@ -168,18 +118,14 @@ class SoilingModule(BaseOcclusionModule):
                     len(dirt_buffer),
                     (1,),
                     device=device,
-                    generator=generator,
                 ).item()
 
-                texture = self._texture_to_rgba(
+                texture = self._texture_to_rgb(
                     dirt_buffer[texture_idx],
                     device,
                 )
 
-                texture_rgb = texture[:3]
-                texture_alpha = texture[3]
-
-                tex_height, tex_width = texture_alpha.shape
+                tex_height, tex_width = texture.shape[-2:]
 
                 patch_width = min(
                     width,
@@ -198,119 +144,41 @@ class SoilingModule(BaseOcclusionModule):
                     ),
                 )
 
-                texture_rgb = F.interpolate(
-                    texture_rgb[None],
+                texture = F.interpolate(
+                    texture[None],
                     size=(patch_height, patch_width),
                     mode="bilinear",
                     align_corners=False,
                 )[0]
 
-                texture_alpha = F.interpolate(
-                    texture_alpha[None, None],
-                    size=(patch_height, patch_width),
-                    mode="bilinear",
-                    align_corners=False,
-                )[0, 0]
-
-                max_x = width - patch_width
-                max_y = height - patch_height
-
                 x = torch.randint(
                     0,
-                    max_x + 1,
+                    max(1, width - patch_width + 1),
                     (1,),
                     device=device,
-                    generator=generator,
                 ).item()
 
                 y = torch.randint(
                     0,
-                    max_y + 1,
+                    max(1, height - patch_height + 1),
                     (1,),
                     device=device,
-                    generator=generator,
                 ).item()
 
-                patch_alpha = texture_alpha
-
-                if car_mask is not None:
-                    patch_alpha = patch_alpha * car_mask[
-                        batch_idx,
-                        0,
-                        y:y + patch_height,
-                        x:x + patch_width,
-                    ]
-
-                patch_alpha = patch_alpha.clamp(0.0, 1.0)
-
-                if not torch.any(patch_alpha > 0):
-                    continue
-
-                current_mask = soil_mask[
+                # Полностью копируем dirt texture на image.
+                result[
                     batch_idx,
-                    0,
+                    :3,
                     y:y + patch_height,
                     x:x + patch_width,
-                ]
+                ] = texture.to(dtype)
 
-                new_mask = torch.maximum(
-                    current_mask,
-                    patch_alpha.to(dtype),
-                )
-
+                # GT = 1 везде, где texture была наложена.
                 soil_mask[
                     batch_idx,
                     0,
                     y:y + patch_height,
                     x:x + patch_width,
-                ] = new_mask
+                ] = 1.0
 
-                if channels == 1:
-                    patch_rgb = (
-                        texture_rgb.mean(dim=0, keepdim=True)
-                    )
-                else:
-                    patch_rgb = texture_rgb
-
-                    if channels == 4:
-                        patch_rgb = torch.cat(
-                            (
-                                patch_rgb,
-                                torch.ones(
-                                    (1, patch_height, patch_width),
-                                    device=device,
-                                    dtype=patch_rgb.dtype,
-                                ),
-                            ),
-                            dim=0,
-                        )
-
-                image_region = dirty_image[
-                    batch_idx,
-                    :patch_rgb.shape[0],
-                    y:y + patch_height,
-                    x:x + patch_width,
-                ]
-
-                alpha = patch_alpha.to(dtype)
-
-                if patch_rgb.shape[0] == 1:
-                    blended = (
-                        image_region * (1.0 - alpha)
-                        + patch_rgb.to(dtype) * alpha
-                    )
-                else:
-                    blended = (
-                        image_region * (1.0 - alpha.unsqueeze(0))
-                        + patch_rgb.to(dtype)
-                        * alpha.unsqueeze(0)
-                    )
-
-                dirty_image[
-                    batch_idx,
-                    :patch_rgb.shape[0],
-                    y:y + patch_height,
-                    x:x + patch_width,
-                ] = blended
-
-        return dirty_image.clamp(0.0, 1.0), soil_mask.clamp(0.0, 1.0)
+        return result.clamp(0.0, 1.0), soil_mask
