@@ -12,28 +12,7 @@ from ..interfaces import BaseOcclusionModule
 
 
 class SoilingModule(BaseOcclusionModule):
-    """
-    Generates a dirt mask without modifying the input image.
-
-    `intensity` controls only the number of dirt patches (degree of contamination from 0 to 1).
-
-    patch textures are sampled from a provided buffer of dirt textures. 
-    The textures can be provided as PIL images or torch tensors.
-
-    Expected texture:
-        RGB/RGBA PIL Image
-        [C, H, W] Tensor
-        [B, C, H, W] Tensor
-
-    For RGB textures, alpha is assumed to be 1 everywhere.
-
-    Returns:
-        image:
-            Original image, unchanged.
-
-        soil_mask:
-            [B, 1, H, W] float tensor in [0, 1].
-    """
+    _MAX_PATCHES = 32
 
     @staticmethod
     def _texture_to_alpha(
@@ -42,7 +21,7 @@ class SoilingModule(BaseOcclusionModule):
     ) -> torch.Tensor:
         if isinstance(texture, Image.Image):
             image = texture.convert("RGBA")
-            array = np.asarray(image)
+            array = np.array(image, copy=True)
 
             tensor = (
                 torch.from_numpy(array)
@@ -53,7 +32,10 @@ class SoilingModule(BaseOcclusionModule):
             )
 
         elif isinstance(texture, torch.Tensor):
-            tensor = texture.to(device=device, dtype=torch.float32)
+            tensor = texture.to(
+                device=device,
+                dtype=torch.float32,
+            )
 
             if tensor.ndim == 4:
                 if tensor.shape[0] == 0:
@@ -80,21 +62,21 @@ class SoilingModule(BaseOcclusionModule):
         channels = tensor.shape[0]
 
         if channels == 1:
-            alpha = tensor[0]
-        elif channels == 3:
-            alpha = torch.ones(
+            return tensor[0]
+
+        if channels == 3:
+            return torch.ones(
                 tensor.shape[-2:],
                 device=device,
                 dtype=torch.float32,
             )
-        elif channels == 4:
-            alpha = tensor[3]
-        else:
-            raise ValueError(
-                f"Texture must have 1, 3 or 4 channels, got {channels}"
-            )
 
-        return alpha.clamp(0.0, 1.0)
+        if channels == 4:
+            return tensor[3]
+
+        raise ValueError(
+            f"Texture must have 1, 3 or 4 channels, got {channels}"
+        )
 
     def apply(
         self,
@@ -107,6 +89,7 @@ class SoilingModule(BaseOcclusionModule):
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         batch_size, _, height, width = image.shape
+
         device = image.device
         dtype = image.dtype
 
@@ -120,13 +103,14 @@ class SoilingModule(BaseOcclusionModule):
             return image, soil_mask
 
         intensity = float(cfg.intensity)
+        intensity = max(0.0, min(1.0, intensity))
 
-        if intensity <= 0:
+        if intensity <= 0.0:
             return image, soil_mask
 
         num_patches = max(
             1,
-            int(round(cfg.max_patches * intensity)),
+            int(round(self._MAX_PATCHES * intensity)),
         )
 
         for batch_idx in range(batch_size):
@@ -143,9 +127,6 @@ class SoilingModule(BaseOcclusionModule):
                     device,
                 )
 
-                if alpha.numel() == 0:
-                    continue
-
                 tex_height, tex_width = alpha.shape
 
                 patch_width = min(
@@ -157,7 +138,11 @@ class SoilingModule(BaseOcclusionModule):
                     height,
                     max(
                         1,
-                        int(patch_width * tex_height / tex_width),
+                        int(
+                            patch_width
+                            * tex_height
+                            / tex_width
+                        ),
                     ),
                 )
 
@@ -182,26 +167,21 @@ class SoilingModule(BaseOcclusionModule):
                     device=device,
                 ).item()
 
+                current = soil_mask[
+                    batch_idx,
+                    0,
+                    y:y + patch_height,
+                    x:x + patch_width,
+                ]
+
                 soil_mask[
                     batch_idx,
                     0,
-                    y : y + patch_height,
-                    x : x + patch_width,
+                    y:y + patch_height,
+                    x:x + patch_width,
                 ] = torch.maximum(
-                    soil_mask[
-                        batch_idx,
-                        0,
-                        y : y + patch_height,
-                        x : x + patch_width,
-                    ],
+                    current,
                     alpha.to(dtype),
                 )
-        print(
-        "soil_mask:",
-        soil_mask.min().item(),
-        soil_mask.max().item(),
-        soil_mask.mean().item(),
-        "nonzero:",
-        (soil_mask > 0).sum().item(),
-    )
-        return image, soil_mask
+
+        return image, soil_mask.clamp(0.0, 1.0)
