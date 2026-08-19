@@ -5,6 +5,7 @@ import kornia.filters as KF
 from ..interfaces import BaseOcclusionModule
 from ..config import RainDropConfig
 from PIL import Image
+import numpy as np
 
 from raindrops_generator.raindrop.dropgenerator import generate_label, generateDrops
 
