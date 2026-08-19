@@ -34,7 +34,7 @@ class FlareModule(BaseOcclusionModule):
         
         # Scale it into a line
         scale = torch.tensor([[streak_length, 0, 0], [0, 2, 0]], dtype=torch.float32, device=device).unsqueeze(0)
-        streak_tensor = kornia.geometry.transform.affine(streak_tensor, scale[..., :2, :2], scale[..., :2, 2])
+        streak_tensor = kornia.geometry.transform.affine(streak_tensor, scale)
         
         # Rotate
         angle_rad = torch.tensor([angle], dtype=torch.float32, device=device)
