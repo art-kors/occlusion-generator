@@ -1,10 +1,8 @@
 import torch
 
 from .config import PipelineConfig
-from .preprocessors import DepthEstimator, CarSegmentator
 from .gt_generator import GTGenerator
 
-from .modules.fog import FogModule
 from .modules.reflection import ReflectionModule
 from .modules.soiling import SoilingModule
 from .modules.flare import FlareModule
@@ -20,16 +18,7 @@ class OcclusionPipeline:
         self.config = config
         self.device = device
 
-        self.depth_estimator = DepthEstimator(
-            device=device
-        )
-
-        self.car_segmentator = CarSegmentator(
-            device=device
-        )
-
         self.modules = {
-            "fog": FogModule(),
             "reflection": ReflectionModule(),
             "soiling": SoilingModule(),
             "flare": FlareModule(),
@@ -45,10 +34,15 @@ class OcclusionPipeline:
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         # ======================================================
-        # 1. Input
+        # 1. INPUT
         # ======================================================
 
         image = image.to(self.device)
+
+        if image.ndim != 4:
+            raise ValueError(
+                f"Expected image [B,C,H,W], got {image.shape}"
+            )
 
         b, c, h, w = image.shape
 
@@ -57,67 +51,34 @@ class OcclusionPipeline:
         print("=" * 70)
 
         print(
-            "[PIPELINE DEBUG] image:",
-            image.shape,
-            "min=",
+            "[PIPELINE DEBUG] input:",
+            tuple(image.shape),
+        )
+
+        print(
+            "[PIPELINE DEBUG] input range:",
             image.min().item(),
-            "max=",
             image.max().item(),
         )
 
         # ======================================================
-        # 2. Preprocessing
+        # 2. NO DEPTH
+        # 3. NO CAR SEGMENTATION
+        # 4. NO FOG
         #
-        # IMPORTANT:
-        # Depth + car segmentation are shared dependencies.
-        # They must NOT depend on fog.enabled.
-        # ======================================================
-
-        depth = self.depth_estimator.estimate(image)
-
-        car_mask = self.car_segmentator.segment(image)
-
-        print(
-            "[PIPELINE DEBUG] depth:",
-            depth.shape,
-            "min=",
-            depth.min().item(),
-            "max=",
-            depth.max().item(),
-            "mean=",
-            depth.mean().item(),
-        )
-
-        print(
-            "[PIPELINE DEBUG] car_mask:",
-            car_mask.shape,
-            "min=",
-            car_mask.min().item(),
-            "max=",
-            car_mask.max().item(),
-            "mean=",
-            car_mask.mean().item(),
-        )
-
-        # ======================================================
-        # 3. Depth adjustment
+        # Deliberately removed.
         #
-        # Keep original behavior:
-        # pixels belonging to car get near depth.
-        # ======================================================
-
-        depth = torch.where(
-            car_mask > 0.5,
-            torch.tensor(
-                0.3,
-                device=self.device,
-                dtype=depth.dtype,
-            ),
-            depth,
-        )
-
-        # ======================================================
-        # 4. Current image
+        # This means:
+        #
+        #     image
+        #       ↓
+        #     reflection
+        #       ↓
+        #     soiling
+        #       ↓
+        #     flare
+        #
+        # No spatial mask can come from depth/car segmentation.
         # ======================================================
 
         current_image = image.clone()
@@ -125,66 +86,114 @@ class OcclusionPipeline:
         generated_masks = {}
 
         # ======================================================
-        # 5. Fog
+        # 5. REFLECTION
         # ======================================================
 
-        current_image, mask = self.modules["fog"].apply(
-            current_image,
-            depth,
-            car_mask,
-            self.config.fog,
-            **kwargs,
-        )
+        if self.config.reflection.enabled:
 
-        generated_masks["fog"] = mask
+            print(
+                "[PIPELINE DEBUG] Applying reflection..."
+            )
 
-        # ======================================================
-        # 6. Reflection
-        # ======================================================
+            current_image, mask = self.modules[
+                "reflection"
+            ].apply(
+                current_image,
+                None,
+                None,
+                self.config.reflection,
+                **kwargs,
+            )
 
-        current_image, mask = self.modules["reflection"].apply(
-            current_image,
-            depth,
-            car_mask,
-            self.config.reflection,
-            **kwargs,
-        )
+            generated_masks["reflection"] = mask
 
-        generated_masks["reflection"] = mask
+        else:
 
-        # ======================================================
-        # 7. Soiling
-        # ======================================================
+            generated_masks["reflection"] = torch.zeros(
+                (b, 1, h, w),
+                device=self.device,
+                dtype=image.dtype,
+            )
 
-        current_image, mask = self.modules["soiling"].apply(
-            current_image,
-            depth,
-            car_mask,
-            self.config.soiling,
-            **kwargs,
-        )
-
-        generated_masks["soiling"] = mask
-
-        soil_mask_for_flare = mask
+            print(
+                "[PIPELINE DEBUG] Reflection: DISABLED"
+            )
 
         # ======================================================
-        # 8. Flare
+        # 6. SOILING
         # ======================================================
 
-        current_image, mask = self.modules["flare"].apply(
-            current_image,
-            depth,
-            car_mask,
-            self.config.flare,
-            soil_mask=soil_mask_for_flare,
-            **kwargs,
-        )
+        if self.config.soiling.enabled:
 
-        generated_masks["flare"] = mask
+            print(
+                "[PIPELINE DEBUG] Applying soiling..."
+            )
+
+            current_image, mask = self.modules[
+                "soiling"
+            ].apply(
+                current_image,
+                None,
+                None,
+                self.config.soiling,
+                **kwargs,
+            )
+
+            generated_masks["soiling"] = mask
+
+        else:
+
+            generated_masks["soiling"] = torch.zeros(
+                (b, 1, h, w),
+                device=self.device,
+                dtype=image.dtype,
+            )
+
+            print(
+                "[PIPELINE DEBUG] Soiling: DISABLED"
+            )
+
+        soil_mask_for_flare = generated_masks[
+            "soiling"
+        ]
 
         # ======================================================
-        # 9. Ground truth
+        # 7. FLARE
+        # ======================================================
+
+        if self.config.flare.enabled:
+
+            print(
+                "[PIPELINE DEBUG] Applying flare..."
+            )
+
+            current_image, mask = self.modules[
+                "flare"
+            ].apply(
+                current_image,
+                None,
+                None,
+                self.config.flare,
+                soil_mask=soil_mask_for_flare,
+                **kwargs,
+            )
+
+            generated_masks["flare"] = mask
+
+        else:
+
+            generated_masks["flare"] = torch.zeros(
+                (b, 1, h, w),
+                device=self.device,
+                dtype=image.dtype,
+            )
+
+            print(
+                "[PIPELINE DEBUG] Flare: DISABLED"
+            )
+
+        # ======================================================
+        # 8. GT
         # ======================================================
 
         gt_masks = self.gt_generator.generate(
@@ -192,7 +201,7 @@ class OcclusionPipeline:
         )
 
         # ======================================================
-        # 10. Final image
+        # 9. OUTPUT
         # ======================================================
 
         current_image = torch.clamp(
@@ -201,11 +210,27 @@ class OcclusionPipeline:
             1.0,
         )
 
+        diff = (
+            current_image - image
+        ).abs()
+
         print(
-            "[PIPELINE DEBUG] output difference:",
+            "[PIPELINE DEBUG] output range:",
+            current_image.min().item(),
+            current_image.max().item(),
+        )
+
+        print(
+            "[PIPELINE DEBUG] mean abs difference:",
+            diff.mean().item(),
+        )
+
+        print(
+            "[PIPELINE DEBUG] changed > 1e-3:",
             (
-                current_image - image
-            ).abs().mean().item(),
+                diff > 1e-3
+            ).float().mean().item() * 100,
+            "%",
         )
 
         print("=" * 70)
