@@ -4,7 +4,7 @@ import kornia
 import kornia.filters as KF
 from ..interfaces import BaseOcclusionModule
 from ..config import RainDropConfig
-
+from PIL import Image
 
 from raindrops_generator.raindrop.dropgenerator import generate_label, generateDrops
 
