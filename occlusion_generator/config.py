@@ -17,19 +17,6 @@ class SoilingConfig(ModuleConfig):
 class FlareConfig(ModuleConfig):
     pass
 
-class PipelineConfig(BaseModel):
-    fog: FogConfig = Field(default_factory=FogConfig)
-    reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
-    soiling: SoilingConfig = Field(default_factory=SoilingConfig)
-    flare: FlareConfig = Field(default_factory=FlareConfig)
-    
-    gt_format: str = "multi_channel" # или "priority_single"
-
-
-class FogConfig(ModuleConfig):
-    color: Tuple[float, float, float] = (0.75, 0.78, 0.82) # RGB нормализованный
-
-
 class RainDropConfig(ModuleConfig):
     """
     Configuration for raindrop generation.
@@ -63,3 +50,15 @@ class RainDropConfig(ModuleConfig):
     B: tuple[float, float] = (3, 1)
     C: tuple[float, float] = (1, 3)
     D: tuple[float, float] = (3, 3)
+
+class PipelineConfig(BaseModel):
+    fog: FogConfig = Field(default_factory=FogConfig)
+    reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
+    soiling: SoilingConfig = Field(default_factory=SoilingConfig)
+    flare: FlareConfig = Field(default_factory=FlareConfig)
+    raindrop: RainDropConfig = Field(default_factory=RainDropConfig)
+    gt_format: str = "multi_channel" # или "priority_single"
+
+
+class FogConfig(ModuleConfig):
+    color: Tuple[float, float, float] = (0.75, 0.78, 0.82) # RGB нормализованный
