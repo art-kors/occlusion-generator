@@ -19,10 +19,8 @@ class SoilingModule(BaseOcclusionModule):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        DEBUG = True
-
         # =========================================================
-        # 1. INPUT
+        # 0. CONFIG
         # =========================================================
 
         if not cfg.enabled or cfg.intensity <= 0:
@@ -31,251 +29,430 @@ class SoilingModule(BaseOcclusionModule):
                 torch.zeros_like(image[:, 0:1]),
             )
 
-        if image.ndim != 4:
-            raise ValueError(
-                f"Expected image [B,C,H,W], got {image.shape}"
-            )
+        DEBUG = True
 
         b, c, h, w = image.shape
         device = image.device
         dtype = image.dtype
 
-        print("\n" + "=" * 70)
-        print("[SOILING] SIMPLE PATCH MODE")
-        print("=" * 70)
-
-        print(
-            "[SOILING] image:",
-            tuple(image.shape),
-        )
+        if DEBUG:
+            print("\n" + "=" * 70)
+            print("[SOILING] MUD MODE")
+            print("=" * 70)
 
         # =========================================================
-        # 2. GET PATCH
+        # 1. GET DIRT PATCH
         # =========================================================
 
-        soil_texture = kwargs.get(
-            "dirt_buffer",
-            None,
-        )
+        dirt = kwargs.get("dirt_buffer", None)
 
-        if soil_texture is None:
+        if dirt is None:
             raise ValueError(
-                "[SOILING] dirt_buffer was not provided"
+                "[SOILING] dirt_buffer is required"
             )
 
-        if not torch.is_tensor(soil_texture):
+        if not torch.is_tensor(dirt):
             raise TypeError(
-                "[SOILING] dirt_buffer must be torch.Tensor"
+                f"[SOILING] dirt_buffer must be Tensor, "
+                f"got {type(dirt)}"
             )
 
-        soil_texture = soil_texture.to(
+        dirt = dirt.to(
             device=device,
             dtype=dtype,
         )
 
         # =========================================================
-        # 3. NORMALIZE PATCH DIMENSIONS
+        # 2. NORMALIZE DIMENSIONS
         # =========================================================
 
-        if soil_texture.ndim == 2:
+        if dirt.ndim == 2:
 
             # [H,W]
-            soil_texture = (
-                soil_texture
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
+            dirt = dirt[None, None]
 
-        elif soil_texture.ndim == 3:
+        elif dirt.ndim == 3:
 
             # [C,H,W]
-            soil_texture = (
-                soil_texture
-                .unsqueeze(0)
-            )
+            dirt = dirt[None]
 
-        elif soil_texture.ndim != 4:
+        elif dirt.ndim != 4:
 
             raise ValueError(
-                "[SOILING] Invalid dirt_buffer shape: "
-                f"{soil_texture.shape}"
+                f"[SOILING] Invalid dirt shape: {dirt.shape}"
             )
 
-        print(
-            "[SOILING] patch:",
-            tuple(soil_texture.shape),
-        )
-
         # =========================================================
-        # 4. BATCH
+        # 3. BATCH
         # =========================================================
 
-        if soil_texture.shape[0] == 1 and b > 1:
+        if dirt.shape[0] == 1 and b > 1:
 
-            soil_texture = soil_texture.expand(
+            dirt = dirt.expand(
                 b,
                 -1,
                 -1,
                 -1,
             )
 
-        elif soil_texture.shape[0] != b:
+        elif dirt.shape[0] != b:
 
             raise ValueError(
                 "[SOILING] Batch mismatch: "
-                f"image={b}, patch={soil_texture.shape[0]}"
+                f"image={b}, dirt={dirt.shape[0]}"
             )
 
         # =========================================================
-        # 5. CHANNELS
+        # 4. CHANNELS
         # =========================================================
 
-        channels = soil_texture.shape[1]
+        dirt_channels = dirt.shape[1]
 
-        if channels == 1:
+        if dirt_channels == 1:
 
-            patch_rgb = soil_texture.expand(
-                -1,
-                c,
-                -1,
-                -1,
+            texture = dirt
+
+        elif dirt_channels == 3:
+
+            # Convert RGB patch to grayscale texture
+            texture = dirt.mean(
+                dim=1,
+                keepdim=True,
             )
-
-        elif channels == 3:
-
-            patch_rgb = soil_texture
 
         else:
 
             raise ValueError(
-                "[SOILING] dirt_buffer must have "
-                f"1 or 3 channels, got {channels}"
+                "[SOILING] Expected 1 or 3 channel dirt texture, "
+                f"got {dirt_channels}"
             )
 
         # =========================================================
-        # 6. IMPORTANT:
-        #    NO RESIZE
+        # 5. NO RESIZE
         # =========================================================
 
-        patch_h = patch_rgb.shape[2]
-        patch_w = patch_rgb.shape[3]
-
-        print(
-            "[SOILING] patch size:",
-            patch_w,
-            "x",
-            patch_h,
-        )
-
-        print(
-            "[SOILING] image size:",
-            w,
-            "x",
-            h,
-        )
+        patch_h = texture.shape[2]
+        patch_w = texture.shape[3]
 
         if patch_h > h or patch_w > w:
 
             raise ValueError(
-                "[SOILING] Patch is larger than image: "
+                "[SOILING] Dirt patch is larger than image: "
                 f"patch={patch_w}x{patch_h}, "
                 f"image={w}x{h}"
             )
 
+        if DEBUG:
+            print(
+                "[SOILING] image:",
+                (w, h),
+            )
+
+            print(
+                "[SOILING] patch:",
+                (patch_w, patch_h),
+            )
+
         # =========================================================
-        # 7. PATCH POSITION
-        #
-        # For now: TOP LEFT.
-        #
-        # No random position.
-        # No resize.
-        # No distortion.
+        # 6. PLACE TEXTURE ON FULL IMAGE CANVAS
         # =========================================================
+
+        texture_canvas = torch.zeros(
+            (b, 1, h, w),
+            device=device,
+            dtype=dtype,
+        )
 
         x = 0
         y = 0
 
-        print(
-            "[SOILING] position:",
-            f"x={x}, y={y}",
-        )
-
-        # =========================================================
-        # 8. CREATE CANVAS
-        # =========================================================
-
-        overlay = torch.zeros(
-            (
-                b,
-                c,
-                h,
-                w,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-
-        alpha = torch.zeros(
-            (
-                b,
-                1,
-                h,
-                w,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-
-        # =========================================================
-        # 9. PLACE PATCH
-        # =========================================================
-
-        overlay[
+        texture_canvas[
             :,
             :,
             y:y + patch_h,
             x:x + patch_w,
-        ] = patch_rgb
+        ] = texture
 
         # =========================================================
-        # 10. CONSTANT ALPHA
+        # 7. NORMALIZE TEXTURE
         #
-        # Do NOT derive alpha from RGB.
+        # Equivalent to:
         #
-        # This is deliberately simple.
+        # dir_texture =
+        #     (dir_texture - min) /
+        #     (max - min)
         # =========================================================
 
-        patch_alpha = float(
-            cfg.intensity
+        tex_min = texture_canvas.amin(
+            dim=(-2, -1),
+            keepdim=True,
         )
 
-        alpha[
-            :,
-            :,
-            y:y + patch_h,
-            x:x + patch_w,
-        ] = patch_alpha
+        tex_max = texture_canvas.amax(
+            dim=(-2, -1),
+            keepdim=True,
+        )
 
-        alpha = torch.clamp(
-            alpha,
+        texture_norm = (
+            texture_canvas - tex_min
+        ) / (
+            tex_max - tex_min + 1e-8
+        )
+
+        texture_norm = torch.clamp(
+            texture_norm,
             0.0,
             1.0,
         )
 
         # =========================================================
-        # 11. BLEND
+        # 8. CREATE MUD MASK
+        #
+        # Old code:
+        #
+        # dir_mask = dir_texture.copy()
+        # dir_mask[dir_mask > 0.5] = 1
+        # GaussianBlur(sigma=6)
+        #
+        # Here we reproduce the idea with PyTorch.
         # =========================================================
 
-        alpha_rgb = alpha.expand(
+        mask = torch.where(
+            texture_norm > 0.5,
+            torch.ones_like(texture_norm),
+            texture_norm,
+        )
+
+        # =========================================================
+        # 9. GAUSSIAN BLUR MASK
+        # =========================================================
+
+        # OpenCV sigmaX=6 equivalent-ish.
+        #
+        # Kernel size ~ 6*sigma + 1
+        # -> 37
+        #
+        # Use odd kernel.
+        # =========================================================
+
+        sigma = 6.0
+        kernel_size = 37
+
+        coords = torch.arange(
+            kernel_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        coords = coords - (
+            kernel_size - 1
+        ) / 2
+
+        kernel = torch.exp(
+            -(
+                coords ** 2
+            ) / (
+                2 * sigma ** 2
+            )
+        )
+
+        kernel = kernel / kernel.sum()
+
+        kernel_2d = (
+            kernel[:, None]
+            * kernel[None, :]
+        )
+
+        kernel_2d = kernel_2d[None, None]
+
+        mask = F.conv2d(
+            mask,
+            kernel_2d,
+            padding=kernel_size // 2,
+        )
+
+        mask = torch.clamp(
+            mask,
+            0.0,
+            1.0,
+        )
+
+        # =========================================================
+        # 10. BROWN MUD COLOR
+        #
+        # Original:
+        #
+        # base_color = np.array([20,42,63])
+        #
+        # IMPORTANT:
+        # OpenCV uses BGR.
+        #
+        # [20,42,63] BGR
+        # =>
+        # [63,42,20] RGB
+        #
+        # =========================================================
+
+        base_color = torch.tensor(
+            [63.0, 42.0, 20.0],
+            device=device,
+            dtype=dtype,
+        )
+
+        base_color = base_color / 255.0
+
+        base_color = base_color.view(
+            1, 3, 1, 1,
+        )
+
+        # =========================================================
+        # 11. IMAGE MEAN
+        #
+        # Old code:
+        #
+        # mean_color = image.mean()
+        # alpha = 0.1
+        # mix_color =
+        #     base_color*(1-alpha)
+        #     + mean_color*alpha
+        #
+        # =========================================================
+
+        mean_color = image.mean()
+
+        color_mix_alpha = 0.1
+
+        mud_color = (
+            base_color
+            * (1.0 - color_mix_alpha)
+            +
+            mean_color
+            * color_mix_alpha
+        )
+
+        # =========================================================
+        # 12. BLUR ORIGINAL IMAGE
+        #
+        # Original:
+        #
+        # image_blur = GaussianBlur(image, sigmaX=15)
+        #
+        # First create Gaussian kernel.
+        # =========================================================
+
+        sigma_img = 15.0
+
+        kernel_size_img = 91
+
+        coords = torch.arange(
+            kernel_size_img,
+            device=device,
+            dtype=dtype,
+        )
+
+        coords = coords - (
+            kernel_size_img - 1
+        ) / 2
+
+        kernel = torch.exp(
+            -(
+                coords ** 2
+            ) / (
+                2 * sigma_img ** 2
+            )
+        )
+
+        kernel = kernel / kernel.sum()
+
+        kernel_2d = (
+            kernel[:, None]
+            * kernel[None, :]
+        )
+
+        kernel_2d = kernel_2d[None, None]
+
+        kernel_rgb = kernel_2d.expand(
+            c,
+            1,
+            kernel_size_img,
+            kernel_size_img,
+        )
+
+        image_blur = F.conv2d(
+            image,
+            kernel_rgb,
+            padding=kernel_size_img // 2,
+            groups=c,
+        )
+
+        # =========================================================
+        # 13. FIRST BLENDING STAGE
+        #
+        # Original:
+        #
+        # image_blur =
+        #     image*(1-mask)
+        #     + image_blur*mask
+        #
+        # This makes the dirty area blurry.
+        # =========================================================
+
+        mask_rgb = mask.expand(
             -1,
             c,
             -1,
             -1,
         )
 
+        blurred_image = (
+            image
+            * (1.0 - mask_rgb)
+            +
+            image_blur
+            * mask_rgb
+        )
+
+        # =========================================================
+        # 14. SECOND BLENDING STAGE
+        #
+        # Original:
+        #
+        # image_out =
+        #     image_blur*(1-dir_mask)
+        #     + mix_color*dir_mask
+        #
+        # =========================================================
+
+        mud_color_full = mud_color.expand(
+            b,
+            -1,
+            h,
+            w,
+        )
+
         result = (
-            image * (1.0 - alpha_rgb)
-            + overlay * alpha_rgb
+            blurred_image
+            * (1.0 - mask_rgb)
+            +
+            mud_color_full
+            * mask_rgb
+        )
+
+        # =========================================================
+        # 15. INTENSITY
+        # =========================================================
+
+        # Instead of making the mask itself weaker,
+        # blend the complete mud result with original image.
+
+        intensity = float(
+            cfg.intensity
+        )
+
+        result = (
+            image * (1.0 - intensity)
+            +
+            result * intensity
         )
 
         result = torch.clamp(
@@ -285,34 +462,39 @@ class SoilingModule(BaseOcclusionModule):
         )
 
         # =========================================================
-        # 12. DEBUG
+        # 16. DEBUG
         # =========================================================
 
-        diff = (
-            result - image
-        ).abs()
+        if DEBUG:
 
-        print(
-            "[SOILING] alpha:",
-            alpha.min().item(),
-            alpha.max().item(),
-        )
+            diff = (
+                result - image
+            ).abs()
 
-        print(
-            "[SOILING] changed pixels:",
-            (
-                diff > 1e-4
-            ).float().mean().item() * 100,
-            "%",
-        )
+            print(
+                "[SOILING] texture range:",
+                texture_norm.min().item(),
+                texture_norm.max().item(),
+            )
 
-        print(
-            "[SOILING] difference:",
-            diff.mean().item(),
-        )
+            print(
+                "[SOILING] mask range:",
+                mask.min().item(),
+                mask.max().item(),
+            )
 
-        print("=" * 70)
-        print("[SOILING] END")
-        print("=" * 70)
+            print(
+                "[SOILING] mask mean:",
+                mask.mean().item(),
+            )
 
-        return result, alpha
+            print(
+                "[SOILING] result difference:",
+                diff.mean().item(),
+            )
+
+            print("=" * 70)
+            print("[SOILING] END")
+            print("=" * 70)
+
+        return result, mask
