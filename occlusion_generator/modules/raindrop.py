@@ -55,6 +55,8 @@ class RainDropModule(BaseOcclusionModule):
             (image_np * 255).astype(np.uint8)
         )
 
+        cfg = cfg.model_dump()
+
         # ---------------------------------------------------------
         # Generate drop positions / label map
         # ---------------------------------------------------------
