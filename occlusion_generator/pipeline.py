@@ -8,6 +8,7 @@ from .modules.fog import FogModule
 from .modules.reflection import ReflectionModule
 from .modules.soiling import SoilingModule
 from .modules.flare import FlareModule
+from .modules.raindrop import RainDropModule
 
 
 class OcclusionPipeline:
@@ -33,6 +34,7 @@ class OcclusionPipeline:
             "reflection": ReflectionModule(),
             "soiling": SoilingModule(),
             "flare": FlareModule(),
+            "raindrop": RainDropModule(),
         }
 
         self.gt_generator = GTGenerator(config)
@@ -286,7 +288,41 @@ class OcclusionPipeline:
             )
 
         # ======================================================
-        # 9. FLARE
+        # 9. RAINDROP
+        # ======================================================
+
+        if self.config.raindrop.enabled:
+
+            print(
+                "[PIPELINE] Applying raindrops..."
+            )
+
+            current_image, mask = (
+                self.modules["raindrop"].apply(
+                    current_image,
+                    depth,
+                    car_mask,
+                    self.config.raindrop,
+                    **kwargs,
+                )
+            )
+
+            generated_masks["raindrop"] = mask
+
+        else:
+
+            print(
+                "[PIPELINE] Raindrop: DISABLED"
+            )
+
+            generated_masks["raindrop"] = torch.zeros(
+                (b, 1, h, w),
+                device=self.device,
+                dtype=image.dtype,
+            )
+
+        # ======================================================
+        # 10. FLARE
         # ======================================================
 
         if self.config.flare.enabled:
@@ -323,7 +359,7 @@ class OcclusionPipeline:
             )
 
         # ======================================================
-        # 10. GT
+        # 11. GT
         # ======================================================
 
         gt_masks = self.gt_generator.generate(
@@ -331,7 +367,7 @@ class OcclusionPipeline:
         )
 
         # ======================================================
-        # 11. OUTPUT
+        # 12. OUTPUT
         # ======================================================
 
         current_image = torch.clamp(
