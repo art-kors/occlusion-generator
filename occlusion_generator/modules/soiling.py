@@ -43,6 +43,36 @@ class SoilingModule(BaseOcclusionModule):
         b, _, h, w = image.shape
         device = image.device
 
+        device = image.device
+
+        # Получаем текстуру из kwargs, если она была передана
+        soil_texture = kwargs.get("soil_texture", None)
+
+        if soil_texture is None:
+            # Fallback: генерируем простую шумовую текстуру
+            soil_texture = (
+                torch.rand((b, 1, h, w), device=device) * 0.6 + 0.2
+            )
+
+        # если texture имеет размер [H, W]
+        if soil_texture.ndim == 2:
+            soil_texture = soil_texture[None, None]
+
+        # [C, H, W]
+        elif soil_texture.ndim == 3:
+            soil_texture = soil_texture[None]
+
+        # resize под image
+        soil_texture = torch.nn.functional.interpolate(
+            soil_texture.float(),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # если texture RGB -> grayscale
+        if soil_texture.shape[1] > 1:
+            soil_texture = soil_texture.mean(dim=1, keepdim=True)
 
         if soil_texture is None:
             # Генерием простую серо-коричневую шумовую маску как заглушку
