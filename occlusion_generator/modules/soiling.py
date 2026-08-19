@@ -40,7 +40,7 @@ class SoilingModule(BaseOcclusionModule):
         if not cfg.enabled or cfg.intensity == 0.0:
             return image, torch.zeros_like(image[:, 0:1, :, :])
         
-        b, _, h, w = image.shape
+        b, c, h, w = image.shape
         device = image.device
 
         device = image.device
