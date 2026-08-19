@@ -47,38 +47,16 @@ class OcclusionPipeline:
         b, c, h, w = image.shape
 
         print("\n" + "=" * 70)
-        print("[PIPELINE DEBUG] START")
+        print("[PIPELINE] START")
         print("=" * 70)
 
         print(
-            "[PIPELINE DEBUG] input:",
+            "[PIPELINE] input:",
             tuple(image.shape),
         )
 
-        print(
-            "[PIPELINE DEBUG] input range:",
-            image.min().item(),
-            image.max().item(),
-        )
-
         # ======================================================
-        # 2. NO DEPTH
-        # 3. NO CAR SEGMENTATION
-        # 4. NO FOG
-        #
-        # Deliberately removed.
-        #
-        # This means:
-        #
-        #     image
-        #       ↓
-        #     reflection
-        #       ↓
-        #     soiling
-        #       ↓
-        #     flare
-        #
-        # No spatial mask can come from depth/car segmentation.
+        # 2. CURRENT IMAGE
         # ======================================================
 
         current_image = image.clone()
@@ -86,14 +64,10 @@ class OcclusionPipeline:
         generated_masks = {}
 
         # ======================================================
-        # 5. REFLECTION
+        # 3. REFLECTION
         # ======================================================
 
         if self.config.reflection.enabled:
-
-            print(
-                "[PIPELINE DEBUG] Applying reflection..."
-            )
 
             current_image, mask = self.modules[
                 "reflection"
@@ -115,19 +89,11 @@ class OcclusionPipeline:
                 dtype=image.dtype,
             )
 
-            print(
-                "[PIPELINE DEBUG] Reflection: DISABLED"
-            )
-
         # ======================================================
-        # 6. SOILING
+        # 4. SOILING
         # ======================================================
 
         if self.config.soiling.enabled:
-
-            print(
-                "[PIPELINE DEBUG] Applying soiling..."
-            )
 
             current_image, mask = self.modules[
                 "soiling"
@@ -149,23 +115,11 @@ class OcclusionPipeline:
                 dtype=image.dtype,
             )
 
-            print(
-                "[PIPELINE DEBUG] Soiling: DISABLED"
-            )
-
-        soil_mask_for_flare = generated_masks[
-            "soiling"
-        ]
-
         # ======================================================
-        # 7. FLARE
+        # 5. FLARE
         # ======================================================
 
         if self.config.flare.enabled:
-
-            print(
-                "[PIPELINE DEBUG] Applying flare..."
-            )
 
             current_image, mask = self.modules[
                 "flare"
@@ -174,7 +128,7 @@ class OcclusionPipeline:
                 None,
                 None,
                 self.config.flare,
-                soil_mask=soil_mask_for_flare,
+                soil_mask=generated_masks["soiling"],
                 **kwargs,
             )
 
@@ -188,12 +142,8 @@ class OcclusionPipeline:
                 dtype=image.dtype,
             )
 
-            print(
-                "[PIPELINE DEBUG] Flare: DISABLED"
-            )
-
         # ======================================================
-        # 8. GT
+        # 6. GROUND TRUTH
         # ======================================================
 
         gt_masks = self.gt_generator.generate(
@@ -201,7 +151,7 @@ class OcclusionPipeline:
         )
 
         # ======================================================
-        # 9. OUTPUT
+        # 7. OUTPUT
         # ======================================================
 
         current_image = torch.clamp(
@@ -210,31 +160,15 @@ class OcclusionPipeline:
             1.0,
         )
 
-        diff = (
-            current_image - image
-        ).abs()
-
         print(
-            "[PIPELINE DEBUG] output range:",
-            current_image.min().item(),
-            current_image.max().item(),
-        )
-
-        print(
-            "[PIPELINE DEBUG] mean abs difference:",
-            diff.mean().item(),
-        )
-
-        print(
-            "[PIPELINE DEBUG] changed > 1e-3:",
+            "[PIPELINE] mean abs difference:",
             (
-                diff > 1e-3
-            ).float().mean().item() * 100,
-            "%",
+                current_image - image
+            ).abs().mean().item(),
         )
 
         print("=" * 70)
-        print("[PIPELINE DEBUG] END")
-        print("=" * 70 + "\n")
+        print("[PIPELINE] END")
+        print("=" * 70)
 
         return current_image, gt_masks
