@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import kornia
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,173 +13,87 @@ from ..interfaces import BaseOcclusionModule
 
 
 class SoilingModule(BaseOcclusionModule):
-    _MAX_PATCHES = 32
+    """
+    Physical lens soiling:
+        - depth-dependent scattering
+        - light absorption
+        - spatial mud contamination
+    """
 
-    @staticmethod
-    def _texture_to_rgb(
-        texture: Any,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if isinstance(texture, Image.Image):
-            image = texture.convert("RGB")
-            array = np.array(image, copy=True)
-
-            tensor = (
-                torch.from_numpy(array)
-                .permute(2, 0, 1)
-                .contiguous()
-                .to(device=device, dtype=torch.float32)
-                / 255.0
-            )
-
-        elif isinstance(texture, torch.Tensor):
-            tensor = texture.to(
-                device=device,
-                dtype=torch.float32,
-            )
-
-            if tensor.ndim == 4:
-                if tensor.shape[0] == 0:
-                    raise ValueError("Empty texture tensor")
-                tensor = tensor[0]
-
-            if tensor.ndim != 3:
-                raise ValueError(
-                    "Texture tensor must have shape [C,H,W] "
-                    f"or [B,C,H,W], got {tuple(tensor.shape)}"
-                )
-
-            if tensor.numel() > 0 and tensor.max() > 1.0:
-                tensor = tensor / 255.0
-
-            tensor = tensor.clamp(0.0, 1.0)
-
-        else:
-            raise TypeError(
-                "Dirt texture must be a PIL Image or torch.Tensor, "
-                f"got {type(texture)!r}"
-            )
-
-        channels = tensor.shape[0]
-
-        if channels == 1:
-            tensor = tensor.repeat(3, 1, 1)
-
-        elif channels == 4:
-            tensor = tensor[:3]
-
-        elif channels != 3:
-            raise ValueError(
-                f"Texture must have 1, 3 or 4 channels, got {channels}"
-            )
-
-        return tensor
-
+    @torch.no_grad()
     def apply(
         self,
         image: torch.Tensor,
         depth: torch.Tensor,
-        car_mask: torch.Tensor | None,
+        car_mask: torch.Tensor,
         cfg: SoilingConfig,
-        dirt_buffer=None,
-        **kwargs: Any,
+        **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        batch_size, channels, height, width = image.shape
+        # ---------------------------------------------------------
+        # Input
+        # ---------------------------------------------------------
+        # image:    [C, H, W]
+        # depth:    [H, W] or [1, H, W]
+        # car_mask: [H, W] or [1, H, W]
 
+        if not cfg.enabled or cfg.intensity == 0.0:
+            return image, torch.zeros_like(image[:, 0:1, :, :])
+        
+        b, _, h, w = image.shape
         device = image.device
-        dtype = image.dtype
 
-        result = image.clone()
 
-        soil_mask = torch.zeros(
-            (batch_size, 1, height, width),
-            device=device,
-            dtype=dtype,
-        )
+        if soil_texture is None:
+            # Генерием простую серо-коричневую шумовую маску как заглушку
+            soil_texture = torch.rand((b, 1, h, w), device=device) * 0.6 + 0.2
+            
+        # Приводим soil_texture к формату [B, C, H, W]
+        if soil_texture.dim() == 2:
+            soil_texture = soil_texture.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+        elif soil_texture.dim() == 3:
+            soil_texture = soil_texture.unsqueeze(0)             # [1, C, H, W]
 
-        if dirt_buffer is None or len(dirt_buffer) == 0:
-            return result, soil_mask
+        # Если текстура грязи одноканальная (маска), размазываем ее на 3 канала (RGB)
+        if soil_texture.shape[1] == 1 and c == 3:
+            soil_rgb = soil_texture.expand(-1, 3, -1, -1)
+            # Используем саму текстуру как альфа-канал (где грязи больше - там непрозрачнее)
+            soil_alpha = soil_texture
+        else:
+            # Если текстура уже цветная (RGB), используем ее как цвет грязи
+            soil_rgb = soil_texture
+            # Вычисляем альфу как среднюю яркость по каналам (черно-белый вариант)
+            soil_alpha = soil_texture.mean(dim=1, keepdim=True)
 
-        intensity = float(cfg.intensity)
-        intensity = max(0.0, min(1.0, intensity))
 
-        if intensity <= 0.0:
-            return result, soil_mask
 
-        num_patches = max(
-            1,
-            int(round(self._MAX_PATCHES * intensity)),
-        )
+        soil_texture = kwargs.get("soil_texture")
+                # Умножаем альфу грязи на маску машины: грязь будет только там, где машина != 0
+        final_alpha = soil_alpha * car_mask
 
-        for batch_idx in range(batch_size):
-            for _ in range(num_patches):
-                texture_idx = torch.randint(
-                    0,
-                    len(dirt_buffer),
-                    (1,),
-                    device=device,
-                ).item()
+        # Масштабируем интенсивность из конфига (от 0.0 до 1.0)
+        final_alpha = final_alpha * cfg.intensity
 
-                texture = self._texture_to_rgb(
-                    dirt_buffer[texture_idx],
-                    device,
-                )
+        # Ограничиваем значения альфы строго от 0 до 1, чтобы не было артефактов
+        final_alpha = torch.clamp(final_alpha, 0.0, 1.0)
 
-                tex_height, tex_width = texture.shape[-2:]
+        # ---------------------------------------------------------
+        # 4. Наложение маски на изображение (Alpha Blending)
+        # ---------------------------------------------------------
+        # Формула: Result = Original * (1 - Alpha) + Overlay * Alpha
+        # Раздвигаем final_alpha [B, 1, H, W] до размера изображения [B, C, H, W]
+        final_alpha_3c = final_alpha.expand_as(image)
 
-                patch_width = min(
-                    width,
-                    max(1, int(width * 0.2)),
-                )
+        # Смешиваем оригинал с цветом грязи в зависимости от альфы
+        soiled_image = image * (1.0 - final_alpha_3c) + soil_rgb * final_alpha_3c
 
-                patch_height = min(
-                    height,
-                    max(
-                        1,
-                        int(
-                            patch_width
-                            * tex_height
-                            / tex_width
-                        ),
-                    ),
-                )
+        # Ограничиваем финальное изображение в допустимый диапазон пикселей
+        soiled_image = torch.clamp(soiled_image, 0.0, 1.0)
 
-                texture = F.interpolate(
-                    texture[None],
-                    size=(patch_height, patch_width),
-                    mode="bilinear",
-                    align_corners=False,
-                )[0]
-
-                x = torch.randint(
-                    0,
-                    max(1, width - patch_width + 1),
-                    (1,),
-                    device=device,
-                ).item()
-
-                y = torch.randint(
-                    0,
-                    max(1, height - patch_height + 1),
-                    (1,),
-                    device=device,
-                ).item()
-
-                # Полностью копируем dirt texture на image.
-                result[
-                    batch_idx,
-                    :3,
-                    y:y + patch_height,
-                    x:x + patch_width,
-                ] = texture.to(dtype)
-
-                # GT = 1 везде, где texture была наложена.
-                soil_mask[
-                    batch_idx,
-                    0,
-                    y:y + patch_height,
-                    x:x + patch_width,
-                ] = 1.0
-
-        return result.clamp(0.0, 1.0), soil_mask
+        # ---------------------------------------------------------
+        # 5. Возврат результатов
+        # ---------------------------------------------------------
+        # Вторым тензором возвращаем саму маску наложения (final_alpha).
+        # Обычно это нужно, чтобы нейросеть (дискретизатор или детектор) 
+        # могла игнорировать эти пиксели при подсчете лосса.
+        return soiled_image, final_alpha
