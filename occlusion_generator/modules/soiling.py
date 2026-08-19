@@ -11,12 +11,19 @@ from ..interfaces import BaseOcclusionModule
 
 class SoilingModule(BaseOcclusionModule):
     """
-    Physical lens soiling with extensive debugging.
+    Physical lens soiling with patch placement.
+
+    IMPORTANT:
+        Dirt patches are NOT resized to the full image.
 
     Expected:
         image:    [B, C, H, W]
         depth:    [B, 1, H, W] / [B, H, W]
         car_mask: [B, 1, H, W] / [B, H, W]
+
+        dirt_buffer:
+            [1, C, H_patch, W_patch]
+            [B, C, H_patch, W_patch]
 
     Returns:
         soiled_image: [B, C, H, W]
@@ -36,6 +43,7 @@ class SoilingModule(BaseOcclusionModule):
         DEBUG = True
 
         def dbg(name: str, x: Any):
+
             if not DEBUG:
                 return
 
@@ -61,67 +69,100 @@ class SoilingModule(BaseOcclusionModule):
         print("[SOILING DEBUG] APPLY START")
         print("=" * 70)
 
-        # ---------------------------------------------------------
-        # 0. Config
-        # ---------------------------------------------------------
+        # =========================================================
+        # 0. CONFIG
+        # =========================================================
 
-        print(f"[SOILING DEBUG] cfg.enabled   = {cfg.enabled}")
-        print(f"[SOILING DEBUG] cfg.intensity = {cfg.intensity}")
+        print(
+            f"[SOILING DEBUG] cfg.enabled   = {cfg.enabled}"
+        )
 
-        # ---------------------------------------------------------
-        # 1. Early exit
-        # ---------------------------------------------------------
+        print(
+            f"[SOILING DEBUG] cfg.intensity = {cfg.intensity}"
+        )
+
+        # =========================================================
+        # 1. EARLY EXIT
+        # =========================================================
 
         if not cfg.enabled or cfg.intensity == 0.0:
+
             print(
-                "[SOILING DEBUG] !!! EARLY EXIT !!! "
-                "Soiling is disabled or intensity == 0"
+                "[SOILING DEBUG] !!! EARLY EXIT !!!"
             )
 
-            return image, torch.zeros_like(image[:, 0:1, :, :])
+            return (
+                image,
+                torch.zeros_like(
+                    image[:, 0:1, :, :]
+                ),
+            )
 
-        # ---------------------------------------------------------
-        # 2. Input
-        # ---------------------------------------------------------
+        # =========================================================
+        # 2. INPUT
+        # =========================================================
 
         dbg("image INPUT", image)
         dbg("depth INPUT", depth)
         dbg("car_mask INPUT", car_mask)
 
         if image.ndim != 4:
+
             raise ValueError(
-                f"[SOILING] Expected image [B,C,H,W], got {image.shape}"
+                "[SOILING] Expected image [B,C,H,W], "
+                f"got {image.shape}"
             )
 
         b, c, h, w = image.shape
+
         device = image.device
 
-        # ---------------------------------------------------------
-        # 3. Normalize car_mask
-        # ---------------------------------------------------------
+        # =========================================================
+        # 3. NORMALIZE CAR MASK
+        # =========================================================
 
         if car_mask.ndim == 2:
-            # [H,W]
-            car_mask = car_mask.unsqueeze(0).unsqueeze(0)
+
+            car_mask = (
+                car_mask
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
 
         elif car_mask.ndim == 3:
-            # Could be [B,H,W] or [1,H,W]
+
             car_mask = car_mask.unsqueeze(1)
 
         elif car_mask.ndim != 4:
+
             raise ValueError(
-                f"[SOILING] Unexpected car_mask shape: {car_mask.shape}"
+                "[SOILING] Unexpected car_mask shape: "
+                f"{car_mask.shape}"
             )
 
-        car_mask = car_mask.to(device=device, dtype=image.dtype)
+        car_mask = car_mask.to(
+            device=device,
+            dtype=image.dtype,
+        )
 
         if car_mask.shape[0] == 1 and b > 1:
-            car_mask = car_mask.expand(b, -1, -1, -1)
+
+            car_mask = car_mask.expand(
+                b,
+                -1,
+                -1,
+                -1,
+            )
 
         if car_mask.shape[1] > 1:
-            car_mask = car_mask.mean(dim=1, keepdim=True)
+
+            car_mask = car_mask.mean(
+                dim=1,
+                keepdim=True,
+            )
 
         if car_mask.shape[-2:] != (h, w):
+
             print(
                 "[SOILING DEBUG] Resizing car_mask:",
                 tuple(car_mask.shape[-2:]),
@@ -135,38 +176,69 @@ class SoilingModule(BaseOcclusionModule):
                 mode="nearest",
             )
 
-        car_mask = torch.clamp(car_mask, 0.0, 1.0)
+        car_mask = torch.clamp(
+            car_mask,
+            0.0,
+            1.0,
+        )
 
-        dbg("car_mask NORMALIZED", car_mask)
+        dbg(
+            "car_mask NORMALIZED",
+            car_mask,
+        )
 
-        # ---------------------------------------------------------
-        # 4. Get soil texture
-        # ---------------------------------------------------------
+        # =========================================================
+        # 4. GET DIRT PATCH
+        # =========================================================
 
-        soil_texture = kwargs.get("dirt_buffer", None)
+        soil_texture = kwargs.get(
+            "dirt_buffer",
+            None,
+        )
 
         print(
             "[SOILING DEBUG] kwargs keys =",
             list(kwargs.keys()),
         )
 
-        dbg("soil_texture RAW", soil_texture)
+        dbg(
+            "soil_texture RAW",
+            soil_texture,
+        )
 
-        # ---------------------------------------------------------
-        # 5. Fallback texture
-        # ---------------------------------------------------------
+        # =========================================================
+        # 5. FALLBACK
+        # =========================================================
 
         if soil_texture is None:
+
             print(
-                "[SOILING DEBUG] !!! soil_texture is None !!!"
+                "[SOILING DEBUG] "
+                "!!! soil_texture is None !!!"
             )
+
             print(
-                "[SOILING DEBUG] Generating fallback texture"
+                "[SOILING DEBUG] "
+                "Generating fallback patch"
+            )
+
+            # IMPORTANT:
+            # fallback is a PATCH, not full image
+
+            patch_size = min(
+                256,
+                h,
+                w,
             )
 
             soil_texture = (
                 torch.rand(
-                    (b, 1, h, w),
+                    (
+                        b,
+                        1,
+                        patch_size,
+                        patch_size,
+                    ),
                     device=device,
                     dtype=image.dtype,
                 )
@@ -174,43 +246,63 @@ class SoilingModule(BaseOcclusionModule):
                 + 0.2
             )
 
-        # ---------------------------------------------------------
-        # 6. Convert texture to tensor/device/dtype
-        # ---------------------------------------------------------
+        # =========================================================
+        # 6. TO DEVICE / DTYPE
+        # =========================================================
+
+        if not torch.is_tensor(soil_texture):
+
+            raise TypeError(
+                "[SOILING] dirt_buffer must be "
+                f"a torch.Tensor, got {type(soil_texture)}"
+            )
 
         soil_texture = soil_texture.to(
             device=device,
             dtype=image.dtype,
         )
 
-        # ---------------------------------------------------------
-        # 7. Normalize texture dimensions
-        # ---------------------------------------------------------
+        # =========================================================
+        # 7. NORMALIZE DIMENSIONS
+        # =========================================================
 
         if soil_texture.ndim == 2:
+
             # [H,W]
-            soil_texture = soil_texture.unsqueeze(0).unsqueeze(0)
+            soil_texture = (
+                soil_texture
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
 
         elif soil_texture.ndim == 3:
-            # Assume [C,H,W] OR [B,H,W]
-            #
-            # For this pipeline we interpret it as [C,H,W]
-            # and add batch dimension.
-            soil_texture = soil_texture.unsqueeze(0)
+
+            # [C,H,W]
+            soil_texture = (
+                soil_texture
+                .unsqueeze(0)
+            )
 
         elif soil_texture.ndim != 4:
+
             raise ValueError(
                 "[SOILING] Unsupported soil_texture shape: "
                 f"{soil_texture.shape}"
             )
 
-        dbg("soil_texture AFTER DIM NORMALIZATION", soil_texture)
+        dbg(
+            "soil_texture AFTER DIM NORMALIZATION",
+            soil_texture,
+        )
 
-        # ---------------------------------------------------------
-        # 8. Batch normalization
-        # ---------------------------------------------------------
+        # =========================================================
+        # 8. BATCH
+        # =========================================================
 
-        if soil_texture.shape[0] == 1 and b > 1:
+        patch_batch = soil_texture.shape[0]
+
+        if patch_batch == 1 and b > 1:
+
             soil_texture = soil_texture.expand(
                 b,
                 -1,
@@ -218,41 +310,45 @@ class SoilingModule(BaseOcclusionModule):
                 -1,
             )
 
-        elif soil_texture.shape[0] != b:
+        elif patch_batch != b:
+
             raise ValueError(
                 "[SOILING] Batch mismatch:\n"
                 f"image batch = {b}\n"
-                f"soil batch  = {soil_texture.shape[0]}"
+                f"soil batch  = {patch_batch}"
             )
 
-        # ---------------------------------------------------------
-        # 9. Resize texture
-        # ---------------------------------------------------------
+        # =========================================================
+        # 9. NO RESIZE !!!
+        # =========================================================
 
-        if soil_texture.shape[-2:] != (h, w):
+        patch_h = soil_texture.shape[2]
+        patch_w = soil_texture.shape[3]
 
-            print(
-                "[SOILING DEBUG] Resizing soil_texture:",
-                tuple(soil_texture.shape[-2:]),
-                "->",
-                (h, w),
-            )
-
-            soil_texture = F.interpolate(
-                soil_texture,
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        dbg(
-            "soil_texture AFTER RESIZE",
-            soil_texture,
+        print(
+            "[SOILING DEBUG] PATCH SIZE:",
+            f"{patch_w}x{patch_h}",
         )
 
-        # ---------------------------------------------------------
-        # 10. Convert texture to RGB + alpha
-        # ---------------------------------------------------------
+        print(
+            "[SOILING DEBUG] IMAGE SIZE:",
+            f"{w}x{h}",
+        )
+
+        if patch_h > h or patch_w > w:
+
+            raise ValueError(
+                "[SOILING] Dirt patch is larger "
+                "than image.\n"
+                f"patch = {patch_w}x{patch_h}\n"
+                f"image = {w}x{h}\n"
+                "Resize the patch before passing it "
+                "to the pipeline."
+            )
+
+        # =========================================================
+        # 10. CONVERT PATCH TO RGB + ALPHA
+        # =========================================================
 
         texture_channels = soil_texture.shape[1]
 
@@ -263,81 +359,168 @@ class SoilingModule(BaseOcclusionModule):
 
         if texture_channels == 1:
 
-            soil_alpha = soil_texture
-
-            soil_rgb = soil_texture.expand(
+            soil_rgb_patch = soil_texture.expand(
                 -1,
                 c,
                 -1,
                 -1,
             )
 
+            soil_alpha_patch = soil_texture
+
         elif texture_channels == 3:
 
-            soil_rgb = soil_texture
+            soil_rgb_patch = soil_texture
 
-            # RGB -> grayscale alpha
-            soil_alpha = soil_texture.mean(
-                dim=1,
-                keepdim=True,
+            soil_alpha_patch = (
+                soil_texture.mean(
+                    dim=1,
+                    keepdim=True,
+                )
             )
 
         else:
 
             raise ValueError(
                 "[SOILING] soil_texture must have "
-                f"1 or 3 channels, got {texture_channels}"
+                f"1 or 3 channels, got "
+                f"{texture_channels}"
             )
 
-        dbg("soil_rgb", soil_rgb)
-        dbg("soil_alpha", soil_alpha)
-
-        # ---------------------------------------------------------
-        # 11. VERY IMPORTANT DEBUG
-        # ---------------------------------------------------------
-
-        print(
-            "[SOILING DEBUG] "
-            f"car_mask mean      = {car_mask.mean().item():.6f}"
-        )
-
-        print(
-            "[SOILING DEBUG] "
-            f"soil_alpha mean    = {soil_alpha.mean().item():.6f}"
-        )
-
-        print(
-            "[SOILING DEBUG] "
-            f"cfg.intensity      = {cfg.intensity}"
-        )
-
-        # ---------------------------------------------------------
-        # 12. Apply car mask
-        # ---------------------------------------------------------
-
-        final_alpha = soil_alpha * car_mask
-
         dbg(
-            "alpha AFTER car_mask",
-            final_alpha,
-        )
-
-        # ---------------------------------------------------------
-        # 13. Apply intensity
-        # ---------------------------------------------------------
-
-        final_alpha = final_alpha * float(
-            cfg.intensity
+            "soil_rgb_patch",
+            soil_rgb_patch,
         )
 
         dbg(
-            "alpha AFTER intensity",
-            final_alpha,
+            "soil_alpha_patch",
+            soil_alpha_patch,
         )
 
-        # ---------------------------------------------------------
-        # 14. Clamp alpha
-        # ---------------------------------------------------------
+        # =========================================================
+        # 11. CREATE FULL-SIZE CANVAS
+        # =========================================================
+
+        soil_rgb = torch.zeros(
+            (
+                b,
+                c,
+                h,
+                w,
+            ),
+            device=device,
+            dtype=image.dtype,
+        )
+
+        soil_alpha = torch.zeros(
+            (
+                b,
+                1,
+                h,
+                w,
+            ),
+            device=device,
+            dtype=image.dtype,
+        )
+
+        # =========================================================
+        # 12. PLACE PATCH
+        # =========================================================
+        #
+        # For now:
+        # top-left corner
+        #
+        # NO RESIZE
+        # NO ROTATION
+        # NO RANDOM POSITION
+        #
+
+        x = 0
+        y = 0
+
+        print(
+            "[SOILING DEBUG] "
+            f"Placing patch at x={x}, y={y}"
+        )
+
+        soil_rgb[
+            :,
+            :,
+            y:y + patch_h,
+            x:x + patch_w,
+        ] = soil_rgb_patch
+
+        soil_alpha[
+            :,
+            :,
+            y:y + patch_h,
+            x:x + patch_w,
+        ] = soil_alpha_patch
+
+        dbg(
+            "soil_rgb CANVAS",
+            soil_rgb,
+        )
+
+        dbg(
+            "soil_alpha CANVAS",
+            soil_alpha,
+        )
+
+        # =========================================================
+        # 13. CAR MASK
+        # =========================================================
+
+        print(
+            "[SOILING DEBUG] car_mask mean:",
+            f"{car_mask.mean().item():.6f}",
+        )
+
+        # IMPORTANT:
+        #
+        # Your current pipeline creates:
+        #
+        # car_mask = zeros(...)
+        #
+        # therefore multiplying by it would completely
+        # remove the dirt.
+        #
+        # For this patch-placement test we DO NOT apply
+        # car_mask if it is completely empty.
+
+        car_mask_is_empty = (
+            car_mask.max().item() <= 1e-6
+        )
+
+        if car_mask_is_empty:
+
+            print(
+                "[SOILING DEBUG] "
+                "car_mask is EMPTY -> "
+                "skipping car_mask for soiling"
+            )
+
+            final_alpha = soil_alpha
+
+        else:
+
+            print(
+                "[SOILING DEBUG] "
+                "Applying car_mask"
+            )
+
+            final_alpha = (
+                soil_alpha * car_mask
+            )
+
+        # =========================================================
+        # 14. INTENSITY
+        # =========================================================
+
+        final_alpha = (
+            final_alpha
+            * float(cfg.intensity)
+        )
 
         final_alpha = torch.clamp(
             final_alpha,
@@ -350,40 +533,31 @@ class SoilingModule(BaseOcclusionModule):
             final_alpha,
         )
 
-        # ---------------------------------------------------------
-        # 15. Check whether alpha is actually non-zero
-        # ---------------------------------------------------------
-
-        alpha_nonzero = (
-            final_alpha > 1e-6
-        ).float().mean().item()
-
-        alpha_gt_01 = (
-            final_alpha > 0.01
-        ).float().mean().item()
-
-        alpha_gt_05 = (
-            final_alpha > 0.05
-        ).float().mean().item()
+        # =========================================================
+        # 15. ALPHA DEBUG
+        # =========================================================
 
         print(
-            "[SOILING DEBUG] alpha > 0:",
-            f"{alpha_nonzero * 100:.2f}%",
+            "[SOILING DEBUG] "
+            "alpha > 0:",
+            f"{(final_alpha > 1e-6).float().mean().item() * 100:.2f}%",
         )
 
         print(
-            "[SOILING DEBUG] alpha > 0.01:",
-            f"{alpha_gt_01 * 100:.2f}%",
+            "[SOILING DEBUG] "
+            "alpha > 0.01:",
+            f"{(final_alpha > 0.01).float().mean().item() * 100:.2f}%",
         )
 
         print(
-            "[SOILING DEBUG] alpha > 0.05:",
-            f"{alpha_gt_05 * 100:.2f}%",
+            "[SOILING DEBUG] "
+            "alpha > 0.05:",
+            f"{(final_alpha > 0.05).float().mean().item() * 100:.2f}%",
         )
 
-        # ---------------------------------------------------------
-        # 16. Alpha blending
-        # ---------------------------------------------------------
+        # =========================================================
+        # 16. BLENDING
+        # =========================================================
 
         final_alpha_3c = final_alpha.expand(
             -1,
@@ -392,35 +566,14 @@ class SoilingModule(BaseOcclusionModule):
             -1,
         )
 
-        dbg(
-            "final_alpha_3c",
-            final_alpha_3c,
-        )
-
-        # Difference before blending
-        overlay_difference = (
-            soil_rgb - image
-        )
-
-        dbg(
-            "soil_rgb - image",
-            overlay_difference,
-        )
-
-        # Actual blend
         soiled_image = (
             image * (1.0 - final_alpha_3c)
             + soil_rgb * final_alpha_3c
         )
 
-        dbg(
-            "soiled_image BEFORE clamp",
-            soiled_image,
-        )
-
-        # ---------------------------------------------------------
-        # 17. Clamp output
-        # ---------------------------------------------------------
+        # =========================================================
+        # 17. OUTPUT
+        # =========================================================
 
         soiled_image = torch.clamp(
             soiled_image,
@@ -433,9 +586,9 @@ class SoilingModule(BaseOcclusionModule):
             soiled_image,
         )
 
-        # ---------------------------------------------------------
-        # 18. Final difference
-        # ---------------------------------------------------------
+        # =========================================================
+        # 18. DIFFERENCE
+        # =========================================================
 
         diff = (
             soiled_image - image
@@ -448,19 +601,19 @@ class SoilingModule(BaseOcclusionModule):
         )
 
         print(
-            f"diff min  = {diff.min().item():.8f}"
+            f"diff min       = {diff.min().item():.8f}"
         )
 
         print(
-            f"diff max  = {diff.max().item():.8f}"
+            f"diff max       = {diff.max().item():.8f}"
         )
 
         print(
-            f"diff mean = {diff.mean().item():.8f}"
+            f"diff mean      = {diff.mean().item():.8f}"
         )
 
         print(
-            f"abs diff mean = {abs_diff.mean().item():.8f}"
+            f"abs diff mean  = {abs_diff.mean().item():.8f}"
         )
 
         print(
@@ -482,4 +635,7 @@ class SoilingModule(BaseOcclusionModule):
         print("[SOILING DEBUG] APPLY END")
         print("=" * 70 + "\n")
 
-        return soiled_image, final_alpha
+        return (
+            soiled_image,
+            final_alpha,
+        )
