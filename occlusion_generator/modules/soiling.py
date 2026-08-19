@@ -143,7 +143,7 @@ class SoilingModule(BaseOcclusionModule):
         # 4. Get soil texture
         # ---------------------------------------------------------
 
-        soil_texture = kwargs.get("soil_texture", None)
+        soil_texture = kwargs.get("dirt_buffer", None)
 
         print(
             "[SOILING DEBUG] kwargs keys =",
