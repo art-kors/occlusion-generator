@@ -12,7 +12,8 @@ class ReflectionConfig(ModuleConfig):
     pass
 
 class SoilingConfig(ModuleConfig):
-    pass
+    apply_distortion: bool = True # Преломление в каплях
+
 class FlareConfig(ModuleConfig):
     pass
 
