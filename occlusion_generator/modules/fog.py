@@ -5,7 +5,7 @@ from ..config import FogConfig
 
 class FogModule(BaseOcclusionModule):
     def apply(self, image: torch.Tensor, depth: torch.Tensor, 
-              car_mask: torch.Tensor, cfg: FogConfig) -> tuple[torch.Tensor, torch.Tensor]:
+              car_mask: torch.Tensor, cfg: FogConfig, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         
         if not cfg.enabled or cfg.intensity == 0.0:
             # Возвращаем оригинал и пустую маску тумана

@@ -7,7 +7,7 @@ class FlareModule(BaseOcclusionModule):
     # Note: Added soil_mask argument as discussed in the pipeline architecture
     def apply(self, image: torch.Tensor, depth: torch.Tensor, 
               car_mask: torch.Tensor, cfg: FlareConfig, 
-              soil_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+              soil_mask: torch.Tensor | None = None, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         
         if not cfg.enabled or cfg.intensity == 0.0:
             return image, torch.zeros_like(image[:, 0:1, :, :])
