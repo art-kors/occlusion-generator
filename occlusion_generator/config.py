@@ -12,7 +12,8 @@ class ReflectionConfig(ModuleConfig):
     pass
 
 class SoilingConfig(ModuleConfig):
-    apply_distortion: bool = True # Преломление в каплях
+    rotation_range: tuple[float, float] = (-45.0, 45.0)
+    scale_range: tuple[float, float] = (0.7, 1.3)
 
 class FlareConfig(ModuleConfig):
     pass
