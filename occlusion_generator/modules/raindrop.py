@@ -1,13 +1,21 @@
-import torch
-import torch.nn.functional as F
-import kornia
-import kornia.filters as KF
-from ..interfaces import BaseOcclusionModule
-from ..config import RainDropConfig
-from PIL import Image
-import numpy as np
+from __future__ import annotations
 
-from raindrops_generator.raindrop.dropgenerator import generate_label, generateDrops
+import os
+import tempfile
+
+import numpy as np
+import torch
+
+from PIL import Image
+
+from ..config import RainDropConfig
+from ..interfaces import BaseOcclusionModule
+
+from raindrops_generator.raindrop.dropgenerator import (
+    generate_label,
+    generateDrops,
+)
+
 
 class RainDropModule(BaseOcclusionModule):
 
@@ -21,32 +29,33 @@ class RainDropModule(BaseOcclusionModule):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        # ---------------------------------------------------------
-        # image: [C, H, W] or [B, C, H, W]
-        # ---------------------------------------------------------
-
-        if image.ndim == 4:
-            if image.shape[0] != 1:
-                raise ValueError(
-                    "RainDropModule currently supports batch size 1"
-                )
-            image = image[0]
-
-        if image.ndim != 3:
+        if image.ndim != 4:
             raise ValueError(
-                f"Expected image with shape [C, H, W], got {image.shape}"
+                f"Expected image [B,C,H,W], got {image.shape}"
             )
 
-        _, height, width = image.shape
+        b, c, height, width = image.shape
 
-        # ---------------------------------------------------------
-        # Convert torch.Tensor -> PIL.Image
-        # ---------------------------------------------------------
+        if b != 1:
+            raise ValueError(
+                "RainDropModule currently supports batch size 1"
+            )
+
+        # ======================================================
+        # 1. Pydantic config -> dict
+        # ======================================================
+
+        cfg_dict = cfg.model_dump()
+
+        # ======================================================
+        # 2. Torch -> PIL
+        # ======================================================
 
         image_np = (
-            image.detach()
+            image[0]
+            .detach()
             .cpu()
-            .clamp(0, 1)
+            .clamp(0.0, 1.0)
             .permute(1, 2, 0)
             .numpy()
         )
@@ -55,44 +64,75 @@ class RainDropModule(BaseOcclusionModule):
             (image_np * 255).astype(np.uint8)
         )
 
-        cfg = cfg.model_dump()
+        # ======================================================
+        # 3. Create temporary input file
+        # ======================================================
 
-        # ---------------------------------------------------------
-        # Generate drop positions / label map
-        # ---------------------------------------------------------
+        temp_path = None
 
-        List_of_Drops, label_map = generate_label(
-            height,
-            width,
-            cfg,
+        try:
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".png",
+                delete=False,
+            ) as tmp:
+
+                temp_path = tmp.name
+
+            image_pil.save(temp_path)
+
+            # ==================================================
+            # 4. Generate drops
+            # ==================================================
+
+            List_of_Drops, label_map = generate_label(
+                height,
+                width,
+                cfg_dict,
+            )
+
+            # ==================================================
+            # 5. Old generator expects FILE PATH
+            # ==================================================
+
+            output_image, output_label, mask = generateDrops(
+                temp_path,
+                cfg_dict,
+                List_of_Drops,
+            )
+
+        finally:
+
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        # ======================================================
+        # 6. Output image -> Tensor
+        # ======================================================
+
+        if not isinstance(output_image, Image.Image):
+            raise TypeError(
+                f"Expected output_image to be PIL.Image, "
+                f"got {type(output_image)}"
+            )
+
+        output_np = np.asarray(
+            output_image
+        ).astype(np.float32) / 255.0
+
+        output_tensor = (
+            torch.from_numpy(output_np)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(
+                device=image.device,
+                dtype=image.dtype,
+            )
         )
 
-        # ---------------------------------------------------------
-        # Generate raindrops
-        # ---------------------------------------------------------
-
-        output_image, output_label, mask = generateDrops(
-            image_pil,
-            cfg,
-            List_of_Drops,
-        )
-
-        # ---------------------------------------------------------
-        # PIL -> torch.Tensor
-        # ---------------------------------------------------------
-
-        output_np = np.asarray(output_image).astype(np.float32) / 255.0
-
-        output_tensor = torch.from_numpy(
-            output_np
-        ).permute(2, 0, 1).to(
-            device=image.device,
-            dtype=image.dtype,
-        )
-
-        # ---------------------------------------------------------
-        # Convert mask to tensor
-        # ---------------------------------------------------------
+        # ======================================================
+        # 7. Mask -> Tensor
+        # ======================================================
 
         mask_np = np.asarray(mask)
 
@@ -100,10 +140,21 @@ class RainDropModule(BaseOcclusionModule):
             mask_np = mask_np[..., 0]
 
         mask_tensor = torch.from_numpy(
-            mask_np
-        ).to(
-            device=image.device,
-            dtype=torch.bool,
+            mask_np.astype(np.float32)
+        )
+
+        if mask_tensor.max() > 1:
+            mask_tensor /= 255.0
+
+        mask_tensor = (
+            mask_tensor
+            .clamp(0.0, 1.0)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(
+                device=image.device,
+                dtype=image.dtype,
+            )
         )
 
         return output_tensor, mask_tensor
