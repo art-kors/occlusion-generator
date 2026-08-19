@@ -12,9 +12,7 @@ class ReflectionConfig(ModuleConfig):
     pass
 
 class SoilingConfig(ModuleConfig):
-    rotation_range: tuple[float, float] = (-45.0, 45.0)
-    scale_range: tuple[float, float] = (0.7, 1.3)
-
+    pass
 class FlareConfig(ModuleConfig):
     pass
 
