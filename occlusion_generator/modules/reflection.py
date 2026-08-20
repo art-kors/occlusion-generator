@@ -1,285 +1,411 @@
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
-import kornia
-import kornia.filters as KF
 
-from ..interfaces import BaseOcclusionModule
 from ..config import ReflectionConfig
+from ..interfaces import BaseOcclusionModule
 
 
 class ReflectionModule(BaseOcclusionModule):
 
+    @torch.no_grad()
     def apply(
         self,
         image: torch.Tensor,
-        depth: torch.Tensor,
-        car_mask: torch.Tensor,
+        depth,
+        car_mask,
         cfg: ReflectionConfig,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        if not cfg.enabled or cfg.intensity == 0.0:
+        # =========================================================
+        # 0. CONFIG
+        # =========================================================
+
+        if not cfg.enabled or cfg.intensity <= 0:
             return (
                 image,
                 torch.zeros_like(image[:, 0:1]),
             )
 
-        b, _, h, w = image.shape
+        DEBUG = True
+
+        b, c, h, w = image.shape
         device = image.device
         dtype = image.dtype
 
-        # ======================================================
-        # 1. REFLECTION TEXTURE
-        # ======================================================
+        if DEBUG:
+            print("\n" + "=" * 70)
+            print("[REFLECTION] REFLECTION MODE")
+            print("=" * 70)
 
-        ref_texture = kwargs.get(
-            "reflection_texture"
+        # =========================================================
+        # 1. GET REFLECTION TEXTURE
+        # =========================================================
+
+        reflection = kwargs.get(
+            "reflection_texture",
+            None,
         )
 
-        if ref_texture is None:
-
-            ref_texture = torch.rand(
-                b,
-                3,
-                h,
-                w,
-                device=device,
-                dtype=dtype,
+        if reflection is None:
+            raise ValueError(
+                "[REFLECTION] reflection_texture is required"
             )
 
-        else:
-
-            ref_texture = ref_texture.to(
-                device=device,
-                dtype=dtype,
+        if not torch.is_tensor(reflection):
+            raise TypeError(
+                "[REFLECTION] reflection_texture must be Tensor, "
+                f"got {type(reflection)}"
             )
 
-            if ref_texture.ndim == 3:
-                ref_texture = ref_texture.unsqueeze(0)
-
-            ref_texture = kornia.geometry.transform.resize(
-                ref_texture,
-                (h, w),
-                antialias=True,
-            )
-
-        # ======================================================
-        # 2. BLUR
-        # ======================================================
-
-        ref_texture = KF.gaussian_blur2d(
-            ref_texture,
-            kernel_size=(5, 5),
-            sigma=(1.0, 1.0),
-        )
-
-        # ======================================================
-        # 3. COLOR TRANSFER
-        # ======================================================
-
-        bg_mean = image.mean(
-            dim=(2, 3),
-            keepdim=True,
-        )
-
-        bg_std = image.std(
-            dim=(2, 3),
-            keepdim=True,
-        ) + 1e-6
-
-        ref_mean = ref_texture.mean(
-            dim=(2, 3),
-            keepdim=True,
-        )
-
-        ref_std = ref_texture.std(
-            dim=(2, 3),
-            keepdim=True,
-        ) + 1e-6
-
-        ref_texture = (
-            (ref_texture - ref_mean)
-            * (bg_std / ref_std)
-            + bg_mean
-        )
-
-        ref_texture = torch.clamp(
-            ref_texture,
-            0.0,
-            1.0,
-        )
-
-        # ======================================================
-        # 4. BARREL DISTORTION
-        # ======================================================
-
-        y, x = torch.meshgrid(
-            torch.linspace(
-                -1,
-                1,
-                h,
-                device=device,
-                dtype=dtype,
-            ),
-            torch.linspace(
-                -1,
-                1,
-                w,
-                device=device,
-                dtype=dtype,
-            ),
-            indexing="ij",
-        )
-
-        r = torch.sqrt(
-            x ** 2 + y ** 2
-        )
-
-        distortion_strength = (
-            0.15 * cfg.intensity
-        )
-
-        r_distorted = (
-            r
-            * (
-                1.0
-                + distortion_strength * r ** 2
-            )
-        )
-
-        scale = torch.where(
-            r > 0,
-            r_distorted / (r + 1e-6),
-            torch.ones_like(r),
-        )
-
-        grid = torch.stack(
-            [
-                x * scale,
-                y * scale,
-            ],
-            dim=-1,
-        )
-
-        grid = (
-            grid
-            .unsqueeze(0)
-            .expand(b, -1, -1, -1)
-        )
-
-        ref_texture = F.grid_sample(
-            ref_texture,
-            grid,
-            align_corners=True,
-            mode="bilinear",
-            padding_mode="zeros",
-        )
-
-        # ======================================================
-        # 5. ORGANIC REFLECTION MASK
-        # ======================================================
-
-        ref_mask = torch.zeros(
-            b,
-            1,
-            h,
-            w,
+        reflection = reflection.to(
             device=device,
             dtype=dtype,
         )
 
-        y_m, x_m = torch.meshgrid(
-            torch.arange(
-                h,
-                device=device,
-                dtype=dtype,
-            ),
-            torch.arange(
-                w,
-                device=device,
-                dtype=dtype,
-            ),
-            indexing="ij",
+        # =========================================================
+        # 2. NORMALIZE DIMENSIONS
+        # =========================================================
+
+        if reflection.ndim == 2:
+
+            # [H,W]
+            reflection = reflection[None, None]
+
+        elif reflection.ndim == 3:
+
+            # [C,H,W]
+            reflection = reflection[None]
+
+        elif reflection.ndim != 4:
+
+            raise ValueError(
+                "[REFLECTION] Invalid reflection texture shape: "
+                f"{reflection.shape}"
+            )
+
+        # =========================================================
+        # 3. BATCH
+        # =========================================================
+
+        if reflection.shape[0] == 1 and b > 1:
+
+            reflection = reflection.expand(
+                b,
+                -1,
+                -1,
+                -1,
+            )
+
+        elif reflection.shape[0] != b:
+
+            raise ValueError(
+                "[REFLECTION] Batch mismatch: "
+                f"image={b}, "
+                f"reflection={reflection.shape[0]}"
+            )
+
+        # =========================================================
+        # 4. CHANNELS
+        # =========================================================
+
+        reflection_channels = reflection.shape[1]
+
+        if reflection_channels == 1:
+
+            # grayscale -> RGB
+            reflection = reflection.expand(
+                -1,
+                3,
+                -1,
+                -1,
+            )
+
+        elif reflection_channels == 3:
+
+            pass
+
+        else:
+
+            raise ValueError(
+                "[REFLECTION] Expected 1 or 3 channels, "
+                f"got {reflection_channels}"
+            )
+
+        # =========================================================
+        # 5. NO RESIZE
+        # =========================================================
+
+        patch_h = reflection.shape[2]
+        patch_w = reflection.shape[3]
+
+        if patch_h > h or patch_w > w:
+
+            raise ValueError(
+                "[REFLECTION] Reflection texture is larger "
+                "than image: "
+                f"texture={patch_w}x{patch_h}, "
+                f"image={w}x{h}"
+            )
+
+        if DEBUG:
+
+            print(
+                "[REFLECTION] image:",
+                (w, h),
+            )
+
+            print(
+                "[REFLECTION] texture:",
+                (patch_w, patch_h),
+            )
+
+        # =========================================================
+        # 6. CREATE FULL CANVAS
+        # =========================================================
+
+        texture_canvas = torch.zeros(
+            (b, 3, h, w),
+            device=device,
+            dtype=dtype,
         )
 
-        for _ in range(4):
+        # Same philosophy as SoilingModule:
+        # put the texture at (0, 0)
 
-            cx = (
-                torch.rand(
-                    1,
-                    device=device,
-                ).item()
-                * w
-            )
+        x = 0
+        y = 0
 
-            cy = (
-                torch.rand(
-                    1,
-                    device=device,
-                ).item()
-                * h
-            )
+        texture_canvas[
+            :,
+            :,
+            y:y + patch_h,
+            x:x + patch_w,
+        ] = reflection
 
-            radius = (
-                torch.rand(
-                    1,
-                    device=device,
-                ).item()
-                * (w * 0.7)
-                + (w * 0.3)
-            )
+        # =========================================================
+        # 7. NORMALIZE TEXTURE
+        # =========================================================
 
-            dist = torch.sqrt(
-                (x_m - cx) ** 2
-                + (y_m - cy) ** 2
-            )
-
-            blob = torch.clamp(
-                1.0 - dist / radius,
-                0.0,
-                1.0,
-            )
-
-            ref_mask = torch.clamp(
-                ref_mask + blob[None, None],
-                0.0,
-                1.0,
-            )
-
-        # Blur mask
-        ref_mask = KF.gaussian_blur2d(
-            ref_mask,
-            kernel_size=(31, 31),
-            sigma=(12.0, 12.0),
+        tex_min = texture_canvas.amin(
+            dim=(2, 3),
+            keepdim=True,
         )
 
-        # ======================================================
-        # 6. ONLY CAR
-        # ======================================================
+        tex_max = texture_canvas.amax(
+            dim=(2, 3),
+            keepdim=True,
+        )
 
-        ref_mask = ref_mask * car_mask
+        texture_norm = (
+            texture_canvas - tex_min
+        ) / (
+            tex_max - tex_min + 1e-8
+        )
 
-        # ======================================================
-        # 7. SCREEN BLENDING
-        # ======================================================
+        texture_norm = torch.clamp(
+            texture_norm,
+            0.0,
+            1.0,
+        )
 
-        screen_blended = (
+        # =========================================================
+        # 8. CREATE REFLECTION MASK
+        # =========================================================
+        #
+        # Reflection mask is derived from brightness
+        # of the supplied reflection texture.
+        #
+        # Bright regions -> stronger reflection.
+        #
+        # =========================================================
+
+        gray = texture_norm.mean(
+            dim=1,
+            keepdim=True,
+        )
+
+        mask = torch.where(
+            gray > 0.5,
+            torch.ones_like(gray),
+            gray,
+        )
+
+        # =========================================================
+        # 9. BLUR MASK
+        # =========================================================
+
+        sigma = 6.0
+        kernel_size = 37
+
+        coords = torch.arange(
+            kernel_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        coords = coords - (
+            kernel_size - 1
+        ) / 2
+
+        kernel = torch.exp(
+            -coords ** 2
+            / (2 * sigma ** 2)
+        )
+
+        kernel = kernel / kernel.sum()
+
+        kernel_2d = (
+            kernel[:, None]
+            * kernel[None, :]
+        )
+
+        kernel_2d = kernel_2d[None, None]
+
+        mask = F.conv2d(
+            mask,
+            kernel_2d,
+            padding=kernel_size // 2,
+        )
+
+        mask = torch.clamp(
+            mask,
+            0.0,
+            1.0,
+        )
+
+        # =========================================================
+        # 10. OPTIONAL REFLECTION BLUR
+        # =========================================================
+
+        sigma_reflection = 3.0
+        kernel_size_reflection = 19
+
+        coords = torch.arange(
+            kernel_size_reflection,
+            device=device,
+            dtype=dtype,
+        )
+
+        coords = coords - (
+            kernel_size_reflection - 1
+        ) / 2
+
+        kernel = torch.exp(
+            -coords ** 2
+            / (2 * sigma_reflection ** 2)
+        )
+
+        kernel = kernel / kernel.sum()
+
+        kernel_2d = (
+            kernel[:, None]
+            * kernel[None, :]
+        )
+
+        kernel_2d = kernel_2d[None, None]
+
+        kernel_rgb = kernel_2d.expand(
+            3,
+            1,
+            kernel_size_reflection,
+            kernel_size_reflection,
+        )
+
+        reflection_blur = F.conv2d(
+            texture_canvas,
+            kernel_rgb,
+            padding=kernel_size_reflection // 2,
+            groups=3,
+        )
+
+        # =========================================================
+        # 11. SCREEN BLENDING
+        # =========================================================
+
+        screen = (
             1.0
             - (1.0 - image)
-            * (1.0 - ref_texture)
+            * (1.0 - reflection_blur)
         )
 
-        alpha = (
-            ref_mask
-            * cfg.intensity
+        # =========================================================
+        # 12. BLEND REFLECTION
+        # =========================================================
+
+        mask_rgb = mask.expand(
+            -1,
+            c,
+            -1,
+            -1,
         )
 
-        final_image = (
-            image * (1.0 - alpha)
-            + screen_blended * alpha
+        reflection_result = (
+            image
+            * (1.0 - mask_rgb)
+            +
+            screen
+            * mask_rgb
         )
 
-        return (
-            final_image,
-            ref_mask,
+        # =========================================================
+        # 13. INTENSITY
+        # =========================================================
+
+        intensity = float(
+            cfg.intensity
         )
+
+        result = (
+            image
+            * (1.0 - intensity)
+            +
+            reflection_result
+            * intensity
+        )
+
+        result = torch.clamp(
+            result,
+            0.0,
+            1.0,
+        )
+
+        # =========================================================
+        # 14. DEBUG
+        # =========================================================
+
+        if DEBUG:
+
+            diff = (
+                result - image
+            ).abs()
+
+            print(
+                "[REFLECTION] texture range:",
+                texture_norm.min().item(),
+                texture_norm.max().item(),
+            )
+
+            print(
+                "[REFLECTION] mask range:",
+                mask.min().item(),
+                mask.max().item(),
+            )
+
+            print(
+                "[REFLECTION] mask mean:",
+                mask.mean().item(),
+            )
+
+            print(
+                "[REFLECTION] result difference:",
+                diff.mean().item(),
+            )
+
+            print("=" * 70)
+            print("[REFLECTION] END")
+            print("=" * 70)
+
+        return result, mask
